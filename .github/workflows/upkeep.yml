@@ -1,0 +1,222 @@
+name: Upkeep
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infra-ci-upkeep
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync workflows
+    outputs:
+      current: ${{ steps.publication.outputs.current }}
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04-arm
+    environment: infra-automation
+    timeout-minutes: 30
+    steps:
+      - name: Create private source token
+        id: source-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.INFRA_APP_CLIENT_ID }}
+          private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+      - name: Verify App installation scope
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          printf '[%s] App installation verification started\n' "$(date -u +%FT%TZ)"
+          response=$(mktemp)
+          error_log=$(mktemp)
+          trap 'rm -f -- "$response" "$error_log"' EXIT
+          if ! gh api 'installation/repositories?per_page=2' >"$response" 2>"$error_log" ||
+             ! jq -e --arg repository "$SOURCE_REPOSITORY" \
+               '.total_count == 1 and .repositories[0].full_name == $repository and .repositories[0].private == true' \
+               "$response" >/dev/null 2>&1; then
+            printf '[%s] error: App installation verification failed\n' "$(date -u +%FT%TZ)" >&2
+            exit 1
+          fi
+          printf '[%s] App installation verification finished (%ss)\n' "$(date -u +%FT%TZ)" "$SECONDS"
+      - &install-nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          install_url: https://releases.nixos.org/nix/nix-2.35.2/install
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+            sandbox = true
+      - name: Publish through infra CLI
+        id: publication
+        env:
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          SOURCE_TOKEN: ${{ steps.source-token.outputs.token }}
+          PUBLISH_TOKEN: ${{ secrets.INFRA_CI_PUBLISH_TOKEN }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          directory=$(mktemp -d)
+          phase='publication preparation'
+          started=$SECONDS
+          progress() {
+            printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$1"
+          }
+          cleanup() {
+            status=$?
+            if (( status != 0 )); then
+              progress "error: $phase failed ($((SECONDS - started))s)" >&2
+            fi
+            # Go module caches contain read-only directories; do not follow source symlinks.
+            if ! { find "$directory" -type d -exec chmod u+w -- {} + && rm -rf -- "$directory"; } 2>/dev/null; then
+              progress "error: private runtime cleanup failed" >&2
+              if (( status == 0 )); then status=1; fi
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+          run_phase() {
+            phase=$1
+            shift
+            started=$SECONDS
+            progress "$phase started"
+            "$@" >"$directory/diagnostics" 2>&1
+            progress "$phase finished ($((SECONDS - started))s)"
+          }
+          # Keep private archive, compiler and CLI diagnostics off public logs.
+          if [[ -z "$PUBLISH_TOKEN" ]]; then
+            phase='publication access configuration'
+            exit 1
+          fi
+          download_source() {
+            GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPOSITORY/tarball" >"$directory/source.tar.gz"
+          }
+          run_phase 'private source download' download_source
+          mkdir "$directory/source" "$directory/home" 2>"$directory/diagnostics"
+          run_phase 'private source extraction' \
+            tar -xzf "$directory/source.tar.gz" --strip-components=1 -C "$directory/source"
+          cd "$directory/source" 2>"$directory/diagnostics"
+          run_phase 'publication CLI build' \
+            env -i PATH="$PATH" HOME="$directory/home" \
+              nix build --extra-experimental-features 'nix-command flakes' \
+                --option accept-flake-config false --no-write-lock-file \
+                --out-link "$directory/infra" .#infra
+          run_phase 'managed workflow publication' \
+            env -i PATH="$PATH" HOME="$directory/home" INFRA_ROOT="$directory/source" \
+              GH_TOKEN="$PUBLISH_TOKEN" "$directory/infra/bin/infra" ci publish
+          check_publication() {
+            tip=$(GH_TOKEN="$PUBLISH_TOKEN" gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+            [[ "$tip" =~ ^[0-9a-f]{40}$ ]]
+            if [[ "$tip" == "$GITHUB_SHA" ]]; then
+              printf 'current=true\n' >>"$GITHUB_OUTPUT"
+            else
+              printf 'current=false\n' >>"$GITHUB_OUTPUT"
+            fi
+          }
+          run_phase 'publication verification' check_publication
+          if [[ "$tip" == "$GITHUB_SHA" ]]; then
+            progress 'CI workflows are current; checking dependencies'
+          else
+            progress 'CI workflows changed; dependencies wait for the next run'
+          fi
+  update:
+    name: Update dependencies
+    needs: sync
+    if: needs.sync.outputs.current == 'true'
+    runs-on: ubuntu-26.04
+    environment: infra-automation
+    timeout-minutes: 60
+    steps:
+      - name: Create private source update token
+        id: source-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.INFRA_APP_CLIENT_ID }}
+          private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.21.0'
+      - *install-nix
+      - name: Run private dependency updater
+        env:
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          SOURCE_TOKEN: ${{ steps.source-token.outputs.token }}
+          API_URL: ${{ github.api_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          UPDATE_FLAKES: 'true'
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          directory=$(mktemp -d)
+          exec 3>&1
+          finish() {
+            status=$?
+            trap - EXIT
+            if (( status != 0 )); then
+              echo "[dependencies] $(date -u +%FT%TZ) Update failed; exit $status" >&3
+              if [[ -f "$directory/source/ci/scripts/dependencies.cjs" ]]; then
+                if ! env -i PATH="$PATH" HOME="$directory/home" \
+                    SOURCE_REPOSITORY="$SOURCE_REPOSITORY" SOURCE_TOKEN="$SOURCE_TOKEN" \
+                    CI_PHASE_FILE="$directory/phase" RUNNER_TEMP="$directory" \
+                    API_URL="$API_URL" RUN_URL="$RUN_URL" RUN_NUMBER="$RUN_NUMBER" \
+                    RUN_ATTEMPT="$RUN_ATTEMPT" JOB_LABEL=dependencies \
+                    node "$directory/source/ci/scripts/dependencies.cjs" --report >&3 2>>"$directory/infra-ci-worker.log"; then
+                  echo 'error: private dependency diagnostics could not be reported' >&3
+                fi
+              else
+                echo 'error: dependency setup failed before private reporting was available' >&3
+              fi
+            fi
+            # Go module caches contain read-only directories; do not follow source symlinks.
+            if ! { find "$directory" -type d -exec chmod u+w -- {} + && rm -rf -- "$directory"; } 2>/dev/null; then
+              echo 'error: private dependency files could not be removed' >&3
+              if (( status == 0 )); then status=1; fi
+            fi
+            exit "$status"
+          }
+          trap finish EXIT
+          progress() {
+            echo "[dependencies] $(date -u +%FT%TZ) $1" >&3
+          }
+          # Keep source, repository names and all tool diagnostics off public logs.
+          (
+            [[ "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ &&
+               "$SOURCE_REPOSITORY" != "$GITHUB_REPOSITORY" ]]
+            progress "Verify private source access: started"
+            export GH_TOKEN="$SOURCE_TOKEN"
+            gh api 'installation/repositories?per_page=2' |
+              jq -e --arg repository "$SOURCE_REPOSITORY" \
+                '.total_count == 1 and .repositories[0].full_name == $repository and .repositories[0].private == true'
+            progress "Verify private source access: finished"
+            progress "Download private updater: started"
+            revision=$(gh api "repos/$SOURCE_REPOSITORY/commits/HEAD" --jq '.sha')
+            [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+            mkdir -p "$directory/source" "$directory/home"
+            gh api "repos/$SOURCE_REPOSITORY/tarball/$revision" >"$directory/source.tar.gz"
+            tar -xzf "$directory/source.tar.gz" --strip-components=1 -C "$directory/source"
+            progress "Download private updater: finished"
+            env -i PATH="$PATH" HOME="$directory/home" \
+              SOURCE_REPOSITORY="$SOURCE_REPOSITORY" SOURCE_TOKEN="$SOURCE_TOKEN" \
+              SOURCE_REVISION="$revision" UPDATE_FLAKES="$UPDATE_FLAKES" \
+              CI_PHASE_FILE="$directory/phase" \
+              node "$directory/source/ci/scripts/dependencies.cjs" >&3
+          ) >"$directory/infra-ci-worker.log" 2>&1
+          progress "Dependency update: finished"

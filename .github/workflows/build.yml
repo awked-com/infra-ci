@@ -1,0 +1,278 @@
+name: NixOS cache
+run-name: 'Build #${{ github.run_number }}'
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Source branch, tag, or commit (empty uses main)
+        required: false
+        type: string
+      host:
+        description: Host to build (empty builds all targets)
+        required: false
+        type: string
+      package:
+        description: Package attribute on host (empty builds its system)
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  packages: write
+
+concurrency:
+  group: infra-ci-publication
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  admit:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04-arm
+    environment: infra-automation
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+      revision: ${{ steps.process.outputs.revision }}
+      runtime: ${{ steps.runtime.outputs.revision }}
+    steps:
+      - name: Require private source access
+        env:
+          APP_CLIENT_ID: ${{ vars.INFRA_APP_CLIENT_ID }}
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+        run: |
+          set +x
+          if [[ -z "$APP_CLIENT_ID" ||
+                ! "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo 'error: private source App access is not configured' >&2
+            exit 1
+          fi
+      - &source-token
+        name: Create private source token
+        id: source-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.INFRA_APP_CLIENT_ID }}
+          private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+      - &verify-scope
+        name: Verify App installation scope
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          response=$(mktemp)
+          error_log=$(mktemp)
+          trap 'rm -f -- "$response" "$error_log"' EXIT
+          if ! gh api 'installation/repositories?per_page=2' >"$response" 2>"$error_log" ||
+             ! jq -e --arg repository "$SOURCE_REPOSITORY" \
+               '.total_count == 1 and .repositories[0].full_name == $repository and .repositories[0].private == true' \
+               "$response" >/dev/null 2>&1; then
+            echo 'error: private source App installation scope is invalid' >&2
+            exit 1
+          fi
+      - &runtime
+        name: Load private CI runtime
+        id: runtime
+        env:
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ steps.source-token.outputs.token }}
+          script: |
+            try {
+              const [owner, repo] = process.env.SOURCE_REPOSITORY.split('/');
+              const revision = process.env.CI_RUNTIME_REVISION ||
+                (await github.rest.repos.getCommit({owner, repo, ref: 'HEAD'})).data.sha;
+              if (!/^[0-9a-f]{40}$/.test(revision)) throw new Error();
+              const {data} = await github.rest.repos.getContent({
+                owner, repo, ref: revision, path: 'ci/scripts/build.cjs'
+              });
+              if (data.type !== 'file' || data.encoding !== 'base64') throw new Error();
+              require('node:fs').writeFileSync(process.env.RUNNER_TEMP + '/infra-ci-build.cjs',
+                Buffer.from(data.content, 'base64'), {mode: 0o600});
+              core.setOutput('revision', revision);
+            } catch {
+              core.setFailed('Cannot load private CI runtime.');
+            }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          ref: ${{ inputs.source || 'main' }}
+          token: ${{ steps.source-token.outputs.token }}
+          persist-credentials: false
+          path: source
+          show-progress: false
+      - &install-nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          # The worker consumes this version's derivation JSON schema.
+          install_url: https://releases.nixos.org/nix/nix-2.35.2/install
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+            sandbox = true
+      - name: Run cache worker
+        id: process
+        env:
+          INPUT_SOURCE: ${{ inputs.source || 'main' }}
+          INPUT_HOST: ${{ inputs.host }}
+          INPUT_PACKAGE: ${{ inputs.package }}
+          INPUT_SOURCE_PATH: ${{ github.workspace }}/source
+          INPUT_MODE: admit
+          INPUT_SYSTEM: ''
+          CI_IDENTITY: ${{ secrets.CI_IDENTITY }}
+          CI_RECIPIENTS: ${{ secrets.CI_RECIPIENTS }}
+          CI_STORAGE: ${{ secrets.CI_STORAGE }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        # JavaScript actions receive GitHub's job-scoped cache credentials.
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with: &process
+          script: |
+            try {
+              await require(process.env.RUNNER_TEMP + '/infra-ci-build.cjs').run(core);
+            } catch {
+              core.setFailed('Private CI run failed.');
+            }
+      - name: Combine build runners
+        id: build-matrix
+        env:
+          COORDINATORS: ${{ steps.process.outputs.matrix }}
+          HELPERS: ${{ steps.process.outputs.helpers }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            try {
+              await require(process.env.RUNNER_TEMP + '/infra-ci-build.cjs').matrix(core);
+            } catch {
+              core.setFailed('Private CI matrix failed.');
+            }
+      - &issue-token
+        name: Create private issue token
+        id: issue-token
+        if: failure()
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.INFRA_APP_CLIENT_ID }}
+          private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+          permission-issues: write
+      - &report-failure
+        name: Report private failure
+        id: report
+        if: failure()
+        env:
+          SOURCE_TOKEN: ${{ steps.issue-token.outputs.token }}
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          API_URL: ${{ github.api_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          JOB_LABEL: ${{ github.job }}
+          JOB_MATRIX: ${{ toJSON(matrix) }}
+          FAILURE_STAGE: ${{ steps.process.outputs.failure-stage }}
+          SOURCE_REF: ${{ inputs.source || 'main' }}
+          TARGET_HOST: ${{ inputs.host }}
+          TARGET_PACKAGE: ${{ inputs.package }}
+          STEP_STATUS: ${{ toJSON(steps) }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ steps.issue-token.outputs.token }}
+          script: |
+            try {
+              const runtime = process.env.RUNNER_TEMP + '/infra-ci-build.cjs';
+              if (require('node:fs').existsSync(runtime)) {
+                await require(runtime).report(core);
+              } else {
+                // Setup can fail before the private runtime is available.
+                const [owner, repo] = process.env.SOURCE_REPOSITORY.split('/');
+                const {data} = await github.rest.apps.listReposAccessibleToInstallation({per_page: 2});
+                if (data.total_count !== 1 || data.repositories[0].full_name !== process.env.SOURCE_REPOSITORY ||
+                    data.repositories[0].private !== true) throw new Error();
+                await github.rest.issues.create({owner, repo,
+                  title: `CI #${process.env.RUN_NUMBER}: setup failed`,
+                  body: `Private CI runtime was unavailable. Run: ${process.env.RUN_URL}`});
+              }
+            } catch {
+              core.setFailed('Private CI report failed.');
+            }
+      - &cleanup
+        name: Remove private runtime and diagnostics
+        if: always()
+        run: |
+          rm -f -- "$RUNNER_TEMP/infra-ci-build.cjs" "$RUNNER_TEMP/nix-ci-worker" \
+            "$RUNNER_TEMP"/infra-ci*.log
+  build:
+    needs: admit
+    name: Build ${{ matrix.system }}/${{ matrix.index }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.admit.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    environment: infra-automation
+    timeout-minutes: 360
+    env:
+      CI_RUNTIME_REVISION: ${{ needs.admit.outputs.runtime }}
+    steps:
+      - *source-token
+      - *verify-scope
+      - *runtime
+      - name: Configure 16 GiB swap
+        shell: bash
+        run: |
+          set -x
+          old_swap=$(swapon --show=NAME --noheadings --raw)
+          swap_file=/infra-ci.swap
+          if [[ -e "$swap_file" ]]; then
+            echo 'error: replacement swap file already exists' >&2
+            exit 1
+          fi
+          while IFS= read -r previous; do
+            [[ -n "$previous" ]] || continue
+            sudo swapoff --verbose "$previous"
+            if [[ -f "$previous" ]]; then
+              sudo rm --verbose -- "$previous"
+            fi
+          done <<< "$old_swap"
+          sudo install --verbose -m 600 /dev/null "$swap_file"
+          sudo fallocate --verbose --length 16G "$swap_file"
+          sudo mkswap "$swap_file"
+          sudo swapon --verbose "$swap_file"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          ref: ${{ needs.admit.outputs.revision }}
+          token: ${{ steps.source-token.outputs.token }}
+          persist-credentials: false
+          path: source
+          show-progress: false
+      - *install-nix
+      - name: Run cache worker
+        id: process
+        env:
+          INPUT_SOURCE: ${{ inputs.source || 'main' }}
+          INPUT_HOST: ${{ inputs.host }}
+          INPUT_PACKAGE: ${{ inputs.package }}
+          INPUT_SOURCE_PATH: ${{ github.workspace }}/source
+          INPUT_MODE: ${{ matrix.index == 0 && 'build' || 'builder' }}
+          INPUT_BUILDER: ${{ matrix.index }}
+          INPUT_SYSTEM: ${{ matrix.system }}
+          CI_IDENTITY: ${{ secrets.CI_IDENTITY }}
+          CI_RECIPIENTS: ${{ secrets.CI_RECIPIENTS }}
+          NIX_SIGNING_KEY: ${{ matrix.index == 0 && secrets.NIX_SIGNING_KEY || '' }}
+          CI_STORAGE: ${{ secrets.CI_STORAGE }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with: *process
+      - *issue-token
+      - *report-failure
+      - *cleanup
