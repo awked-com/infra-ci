@@ -1,0 +1,55 @@
+name: Cache maintenance
+run-name: Maintenance
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      request:
+        description: Retained request identifier (empty uses the latest cache)
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  packages: write
+
+# Retention must not delete artifacts while a build publishes checkpoints.
+concurrency:
+  group: infra-ci-publication
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  maintenance:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          # Keep private worker build outputs out of the public Actions cache.
+          cache: false
+      - name: Prune expired artifacts
+        env:
+          INPUT_REQUEST: ${{ inputs.request }}
+          INPUT_MODE: maintenance
+          CI_IDENTITY: ${{ secrets.CI_IDENTITY }}
+          CI_STORAGE: ${{ secrets.CI_STORAGE }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set +x
+          log_token=$(uuidgen)
+          echo "::stop-commands::$log_token"
+          trap 'printf "\n::%s::\n" "$log_token"' EXIT
+          ulimit -c 0
+          bootstrap="$RUNNER_TEMP/infra-ci-bootstrap"
+          for file in main.go go.mod go.sum ci/worker/cache.go ci/worker/source.go; do
+            mkdir -p "$(dirname "$bootstrap/$file")"
+            curl --fail --silent --show-error --location \
+              "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/.github/bootstrap/$file" \
+              --output "$bootstrap/$file"
+          done
+          GOTOOLCHAIN=local go -C "$bootstrap" run -mod=readonly .

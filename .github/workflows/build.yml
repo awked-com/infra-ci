@@ -1,0 +1,155 @@
+name: NixOS cache
+run-name: "Build #${{ github.run_number }} [${{ inputs.request }}]"
+on:
+  workflow_dispatch:
+    inputs:
+      request:
+        description: Request identifier
+        required: true
+        type: string
+      worker:
+        description: Worker bundle digest
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  packages: write
+
+concurrency:
+  group: infra-ci-publication
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  admit:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    outputs:
+      parent: ${{ steps.process.outputs.parent }}
+      attempt: ${{ steps.process.outputs.attempt }}
+    steps:
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          # Keep private worker build outputs out of the public Actions cache.
+          cache: false
+      - name: Process
+        id: process
+        env:
+          INPUT_REQUEST: ${{ inputs.request }}
+          INPUT_WORKER: ${{ inputs.worker }}
+          INPUT_MODE: admit
+          INPUT_PARENT: ""
+          INPUT_SYSTEM: ""
+          CI_IDENTITY: ${{ secrets.CI_IDENTITY }}
+          CI_RECIPIENTS: ${{ secrets.CI_RECIPIENTS }}
+          NIX_SIGNING_KEY: ${{ secrets.NIX_SIGNING_KEY }}
+          CI_STORAGE: ${{ secrets.CI_STORAGE }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: &bootstrap |
+          set +x
+          log_token=$(uuidgen)
+          echo "::stop-commands::$log_token"
+          trap 'printf "\n::%s::\n" "$log_token"' EXIT
+          ulimit -c 0
+          bootstrap="$RUNNER_TEMP/infra-ci-bootstrap"
+          mkdir -p "$bootstrap"
+          for file in main.go go.mod go.sum ci/worker/cache.go ci/worker/source.go; do
+            mkdir -p "$(dirname "$bootstrap/$file")"
+            curl --fail --silent --show-error --location \
+              "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/.github/bootstrap/$file" \
+              --output "$bootstrap/$file"
+          done
+          GOTOOLCHAIN=local go -C "$bootstrap" run -mod=readonly .
+  build:
+    needs: admit
+    name: Build ${{ matrix.system }}
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+          - system: aarch64-darwin
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          # Keep private worker build outputs out of the public Actions cache.
+          cache: false
+      - name: Retry macOS Nix daemon startup
+        if: runner.os == 'macOS'
+        run: |
+          wrapper="$RUNNER_TEMP/nix-installer-sudo"
+          cat > "$wrapper" <<'EOF'
+          #!/bin/bash
+          if [[ "$*" == "env launchctl kickstart -k system/org.nixos.nix-daemon" ]]; then
+            for attempt in {1..10}; do
+              sudo "$@" && exit 0
+              sleep 0.5
+            done
+          fi
+          exec sudo "$@"
+          EOF
+          chmod +x "$wrapper"
+          echo "NIX_BECOME=$wrapper" >> "$GITHUB_ENV"
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          # The worker consumes this version's derivation JSON schema.
+          install_url: https://releases.nixos.org/nix/nix-2.34.8/install
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+            sandbox = true
+      - name: Process
+        id: process
+        env:
+          INPUT_REQUEST: ${{ inputs.request }}
+          INPUT_WORKER: ${{ inputs.worker }}
+          INPUT_MODE: build
+          INPUT_PARENT: ${{ needs.admit.outputs.parent }}
+          INPUT_ADMISSION_ATTEMPT: ${{ needs.admit.outputs.attempt }}
+          INPUT_SYSTEM: ${{ matrix.system }}
+          CI_IDENTITY: ${{ secrets.CI_IDENTITY }}
+          CI_RECIPIENTS: ${{ secrets.CI_RECIPIENTS }}
+          NIX_SIGNING_KEY: ${{ secrets.NIX_SIGNING_KEY }}
+          CI_STORAGE: ${{ secrets.CI_STORAGE }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: *bootstrap
+  finalize:
+    if: ${{ always() && github.ref == 'refs/heads/main' && needs.admit.result == 'success' }}
+    needs: [admit, build]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - name: Process
+        id: process
+        env:
+          INPUT_REQUEST: ${{ inputs.request }}
+          INPUT_WORKER: ${{ inputs.worker }}
+          INPUT_MODE: finalize
+          INPUT_PARENT: ${{ needs.admit.outputs.parent }}
+          INPUT_ADMISSION_ATTEMPT: ${{ needs.admit.outputs.attempt }}
+          INPUT_SYSTEM: ""
+          CI_IDENTITY: ${{ secrets.CI_IDENTITY }}
+          CI_RECIPIENTS: ${{ secrets.CI_RECIPIENTS }}
+          NIX_SIGNING_KEY: ${{ secrets.NIX_SIGNING_KEY }}
+          CI_STORAGE: ${{ secrets.CI_STORAGE }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: *bootstrap

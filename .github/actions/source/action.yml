@@ -1,0 +1,46 @@
+name: Infra CI source
+description: Retrieve an authenticated, encrypted source snapshot for any CI workflow
+inputs:
+  repository:
+    description: GHCR package containing source snapshots
+    required: true
+  source:
+    description: Full source commit hash, immutable manifest digest, or latest
+    default: latest
+  identity:
+    description: Age identity authorized to decrypt the source
+    required: true
+  token:
+    description: GitHub token with read access to the GHCR package
+    default: ${{ github.token }}
+outputs:
+  path:
+    description: Directory containing the extracted source
+    value: ${{ steps.source.outputs.path }}
+  digest:
+    description: Resolved immutable source manifest digest
+    value: ${{ steps.source.outputs.digest }}
+  revision:
+    description: Full source commit hash
+    value: ${{ steps.source.outputs.revision }}
+runs:
+  using: composite
+  steps:
+    - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      with:
+        extra_nix_config: |
+          experimental-features = nix-command flakes
+          accept-flake-config = false
+    - id: source
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      env:
+        CI_IDENTITY: ${{ inputs.identity }}
+        SOURCE_REPOSITORY: ${{ inputs.repository }}
+        SOURCE_REF: ${{ inputs.source }}
+        REGISTRY_USER: ${{ github.actor }}
+        REGISTRY_TOKEN: ${{ inputs.token }}
+      run: |
+        set +x
+        ulimit -c 0
+        nix shell github:NixOS/nixpkgs/eaad089433ca2bb662274377d33df3d0e51ef28b#go -c go run ./ci/worker/cmd/infra-ci-source
