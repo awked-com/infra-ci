@@ -1,0 +1,230 @@
+name: Upkeep
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infra-ci-upkeep
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync workflows
+    outputs:
+      current: ${{ steps.inspection.outputs.current == 'true' || steps.publication.outputs.current == 'true' }}
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04-arm
+    environment: infra-automation
+    timeout-minutes: 30
+    steps:
+      - name: Create private source token
+        id: source-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.INFRA_APP_CLIENT_ID }}
+          private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+      - name: Verify App installation scope
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          printf '[%s] App installation verification started\n' "$(date -u +%FT%TZ)"
+          response=$(mktemp)
+          error_log=$(mktemp)
+          trap 'rm -f -- "$response" "$error_log"' EXIT
+          if ! gh api 'installation/repositories?per_page=2' >"$response" 2>"$error_log" ||
+             ! jq -e --arg repository "$SOURCE_REPOSITORY" \
+               '.total_count == 1 and .repositories[0].full_name == $repository and .repositories[0].private == true' \
+               "$response" >/dev/null 2>&1; then
+            printf '[%s] error: App installation verification failed\n' "$(date -u +%FT%TZ)" >&2
+            exit 1
+          fi
+          printf '[%s] App installation verification finished (%ss)\n' "$(date -u +%FT%TZ)" "$SECONDS"
+      - name: Compare managed workflows
+        id: inspection
+        env:
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ steps.source-token.outputs.token }}
+          script: |
+            try {
+              const [owner, repo] = process.env.SOURCE_REPOSITORY.split('/');
+              const source = {owner, repo};
+              const [{data: privateCommit}, {data: publicCommit}] = await Promise.all([
+                github.rest.repos.getCommit({...source, ref: 'HEAD'}),
+                github.rest.repos.getCommit({...context.repo, ref: 'main'})
+              ]);
+              const revision = privateCommit.sha;
+              if (!/^[0-9a-f]{40}$/.test(revision)) throw new Error();
+              core.setSecret(revision);
+              core.exportVariable('SOURCE_REVISION', revision);
+              const [{data: privateTree}, {data: publicTree}] = await Promise.all([
+                github.rest.git.getTree({...source, tree_sha: privateCommit.commit.tree.sha, recursive: '1'}),
+                github.rest.git.getTree({...context.repo, tree_sha: publicCommit.commit.tree.sha, recursive: '1'})
+              ]);
+              if (privateTree.truncated || publicTree.truncated) throw new Error();
+              const files = ['.github/workflows/build.yml', '.github/workflows/upkeep.yml'];
+              const directories = ['.github', '.github/workflows'];
+              for (const name of ['ci', ...directories.map(name => `ci/${name}`)]) {
+                if (!privateTree.tree.some(entry => entry.path === name && entry.type === 'tree' && entry.mode === '040000')) throw new Error();
+              }
+              const expected = files.map(name => {
+                const entry = privateTree.tree.find(entry => entry.path === `ci/${name}`);
+                if (!entry || entry.type !== 'blob' || entry.mode !== '100644') throw new Error();
+                return {...entry, path: name};
+              });
+              const matches = publicCommit.parents.length === 0 &&
+                publicTree.tree.length === files.length + directories.length &&
+                directories.every(name => publicTree.tree.some(entry => entry.path === name && entry.type === 'tree' && entry.mode === '040000')) &&
+                expected.every(file => publicTree.tree.some(entry => entry.path === file.path && entry.type === file.type && entry.mode === file.mode && entry.sha === file.sha));
+              core.setOutput('changed', !matches);
+              core.setOutput('current', matches && publicCommit.sha === context.sha);
+              core.info(matches ? 'Managed workflows are unchanged.' : 'Managed workflows need publication.');
+            } catch {
+              core.setFailed('Cannot compare managed workflows.');
+            }
+      - name: Publish managed workflows
+        if: steps.inspection.outputs.changed == 'true'
+        id: publication
+        env:
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          SOURCE_TOKEN: ${{ steps.source-token.outputs.token }}
+          PUBLISH_TOKEN: ${{ secrets.INFRA_CI_PUBLISH_TOKEN }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          directory=$(mktemp -d)
+          trap 'rm -rf -- "$directory"' EXIT
+          progress() {
+            printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$1"
+          }
+          # Keep private archive and tool diagnostics off public logs.
+          {
+            [[ -n "$PUBLISH_TOKEN" ]]
+            mkdir "$directory/source"
+            GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPOSITORY/tarball/$SOURCE_REVISION" |
+              tar -xz --strip-components=1 -C "$directory/source"
+            commit=$(bash "$directory/source/ci/scripts/workflows.sh" "$directory/source" "$directory/repository")
+            tip=$(GH_TOKEN="$PUBLISH_TOKEN" gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+            [[ "$commit" =~ ^[0-9a-f]{40}$ && "$tip" =~ ^[0-9a-f]{40}$ ]]
+            authorization=$(printf 'x-access-token:%s' "$PUBLISH_TOKEN" | base64 -w0)
+            # Pass credentials only to the push, outside arguments.
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization" GIT_TERMINAL_PROMPT=0 \
+              git -C "$directory/repository" push --quiet --force-with-lease="refs/heads/main:$tip" \
+                "https://github.com/$GITHUB_REPOSITORY.git" "$commit:refs/heads/main"
+            published=$(GH_TOKEN="$PUBLISH_TOKEN" gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+            [[ "$published" == "$commit" ]]
+          } >"$directory/diagnostics" 2>&1 || {
+            progress 'error: managed workflow publication failed' >&2
+            exit 1
+          }
+          progress 'Managed workflows published'
+          # This run uses the previous workflows; dependencies wait for the next run.
+          printf 'current=false\n' >>"$GITHUB_OUTPUT"
+  update:
+    name: Update dependencies
+    needs: sync
+    if: needs.sync.outputs.current == 'true'
+    runs-on: ubuntu-26.04
+    environment: infra-automation
+    timeout-minutes: 60
+    steps:
+      - name: Create private source update token
+        id: source-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.INFRA_APP_CLIENT_ID }}
+          private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.22.0'
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+        with:
+          install_url: https://releases.nixos.org/nix/nix-2.35.3/install
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+            sandbox = true
+      - name: Run private dependency updater
+        env:
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          SOURCE_TOKEN: ${{ steps.source-token.outputs.token }}
+          API_URL: ${{ github.api_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          directory=$(mktemp -d)
+          exec 3>&1
+          finish() {
+            status=$?
+            trap - EXIT
+            if (( status != 0 )); then
+              echo "[dependencies] $(date -u +%FT%TZ) Update failed; exit $status" >&3
+              if [[ -f "$directory/source/ci/scripts/dependencies.cjs" ]]; then
+                if ! env -i PATH="$PATH" HOME="$directory/home" \
+                    SOURCE_REPOSITORY="$SOURCE_REPOSITORY" SOURCE_TOKEN="$SOURCE_TOKEN" \
+                    CI_PHASE_FILE="$directory/phase" RUNNER_TEMP="$directory" \
+                    API_URL="$API_URL" RUN_URL="$RUN_URL" RUN_NUMBER="$RUN_NUMBER" \
+                    RUN_ATTEMPT="$RUN_ATTEMPT" JOB_LABEL=dependencies \
+                    node "$directory/source/ci/scripts/dependencies.cjs" --report >&3 2>>"$directory/infra-ci-worker.log"; then
+                  echo 'error: private dependency diagnostics could not be reported' >&3
+                fi
+              else
+                echo 'error: dependency setup failed before private reporting was available' >&3
+              fi
+            fi
+            # Go module caches contain read-only directories; do not follow source symlinks.
+            if ! { find "$directory" -type d -exec chmod u+w -- {} + && rm -rf -- "$directory"; } 2>/dev/null; then
+              echo 'error: private dependency files could not be removed' >&3
+              if (( status == 0 )); then status=1; fi
+            fi
+            exit "$status"
+          }
+          trap finish EXIT
+          progress() {
+            echo "[dependencies] $(date -u +%FT%TZ) $1" >&3
+          }
+          # Keep source, repository names and all tool diagnostics off public logs.
+          (
+            [[ "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ &&
+               "$SOURCE_REPOSITORY" != "$GITHUB_REPOSITORY" ]]
+            progress "Verify private source access: started"
+            export GH_TOKEN="$SOURCE_TOKEN"
+            gh api 'installation/repositories?per_page=2' |
+              jq -e --arg repository "$SOURCE_REPOSITORY" \
+                '.total_count == 1 and .repositories[0].full_name == $repository and .repositories[0].private == true'
+            progress "Verify private source access: finished"
+            progress "Download private updater: started"
+            revision=$(gh api "repos/$SOURCE_REPOSITORY/commits/HEAD" --jq '.sha')
+            [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+            mkdir -p "$directory/source" "$directory/home"
+            gh api "repos/$SOURCE_REPOSITORY/tarball/$revision" >"$directory/source.tar.gz"
+            tar -xzf "$directory/source.tar.gz" --strip-components=1 -C "$directory/source"
+            progress "Download private updater: finished"
+            env -i PATH="$PATH" HOME="$directory/home" \
+              SOURCE_REPOSITORY="$SOURCE_REPOSITORY" SOURCE_TOKEN="$SOURCE_TOKEN" \
+              SOURCE_REVISION="$revision" \
+              CI_PHASE_FILE="$directory/phase" \
+              node "$directory/source/ci/scripts/dependencies.cjs" >&3
+          ) >"$directory/infra-ci-worker.log" 2>&1
+          progress "Dependency update: finished"

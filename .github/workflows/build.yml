@@ -1,0 +1,329 @@
+name: NixOS cache
+run-name: 'Build #${{ github.run_number }}'
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Source branch, tag, or commit (empty uses main)
+        required: false
+        type: string
+      host:
+        description: Host to build (empty builds all targets)
+        required: false
+        type: string
+      package:
+        description: Package attribute on host (empty builds its system)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: infra-ci-publication
+  cancel-in-progress: false
+  queue: max
+
+env:
+  SHARDS: 4
+
+jobs:
+  # Each system has its own build and publish jobs, so a system publishes as
+  # soon as its own shards finish.
+  build-x86_64:
+    if: github.ref == 'refs/heads/main'
+    name: Build ${{ matrix.system }}/${{ matrix.shard }}
+    strategy:
+      fail-fast: false
+      matrix:
+        system: [x86_64-linux]
+        runner: [ubuntu-26.04]
+        # Keep in sync with SHARDS.
+        shard: [0, 1, 2, 3]
+    runs-on: ${{ matrix.runner }}
+    environment: infra-automation
+    timeout-minutes: 360
+    env: &build-env
+      INPUT_ROLE: build
+      INPUT_SHARD: ${{ matrix.shard }}
+      JOB_LABEL: build ${{ matrix.system }}/${{ matrix.shard }}
+    steps: &build-steps
+      - &source-token
+        name: Create private source token
+        id: source-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.INFRA_APP_CLIENT_ID }}
+          private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+      # One step checks the App scope and resolves both the trusted
+      # default-branch commit and the build commit, so every checkout is pinned.
+      - &resolve-sources
+        name: Resolve private sources
+        id: sources
+        env:
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          SOURCE_REF: ${{ inputs.source || 'main' }}
+          # Publication checks out the source only to evaluate.
+          BUILDS_SOURCE: ${{ startsWith(github.job, 'build') }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ steps.source-token.outputs.token }}
+          script: |
+            try {
+              const repository = process.env.SOURCE_REPOSITORY;
+              if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) throw new Error();
+              const [owner, repo] = repository.split('/');
+              const [{data: scope}, {data: runtime}, {data: source}] = await Promise.all([
+                github.rest.apps.listReposAccessibleToInstallation({per_page: 2}),
+                github.rest.repos.getCommit({owner, repo, ref: 'HEAD'}),
+                github.rest.repos.getCommit({owner, repo, ref: process.env.SOURCE_REF})
+              ]);
+              if (scope.total_count !== 1 || scope.repositories[0].full_name !== repository ||
+                  scope.repositories[0].private !== true ||
+                  ![runtime.sha, source.sha].every(sha => /^[0-9a-f]{40}$/.test(sha))) throw new Error();
+              const reuse = process.env.BUILDS_SOURCE === 'true' && runtime.sha === source.sha;
+              core.setOutput('runtime', runtime.sha);
+              core.setOutput('source', source.sha);
+              core.setOutput('runtime-directory', reuse ? 'source' : 'runtime');
+            } catch {
+              core.setFailed('Private source App installation scope is invalid.');
+            }
+      - name: Check out build source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: &source-checkout-with
+          repository: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          ref: ${{ steps.sources.outputs.source }}
+          token: ${{ steps.source-token.outputs.token }}
+          persist-credentials: false
+          path: source
+          show-progress: false
+      # The worker always comes from the default branch; candidate sources
+      # cannot change the code that holds the CI credentials. A build of that
+      # same commit reuses its checkout.
+      - &runtime-checkout
+        name: Check out trusted worker source
+        if: steps.sources.outputs.runtime-directory == 'runtime'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          ref: ${{ steps.sources.outputs.runtime }}
+          token: ${{ steps.source-token.outputs.token }}
+          persist-credentials: false
+          path: runtime
+          show-progress: false
+      # The worker consumes this Nix version's derivation JSON schema.
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+        with: &nix-with
+          install_url: https://releases.nixos.org/nix/nix-2.35.3/install
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+            sandbox = true
+      - &worker-key
+        name: Derive worker cache key
+        id: worker-key
+        env:
+          CI_IDENTITY: ${{ secrets.CI_IDENTITY }}
+          CI_RUNTIME_PATH: &runtime-path ${{ github.workspace }}/${{ steps.sources.outputs.runtime-directory }}
+          SYSTEM: ${{ matrix.system }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await require(process.env.CI_RUNTIME_PATH + '/ci/scripts/build.cjs').key(core);
+      - &worker-restore
+        name: Restore encrypted worker
+        id: worker-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/nix-ci-worker.enc
+          key: ${{ steps.worker-key.outputs.key }}
+      - &worker-bootstrap
+        name: Prepare worker
+        id: bootstrap
+        env:
+          CI_IDENTITY: ${{ secrets.CI_IDENTITY }}
+          CI_RUNTIME_PATH: *runtime-path
+          CACHE_KEY: ${{ steps.worker-key.outputs.key }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await require(process.env.CI_RUNTIME_PATH + '/ci/scripts/build.cjs').bootstrap(core);
+      - &worker-save
+        name: Save encrypted worker
+        if: steps.bootstrap.outputs.built == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/nix-ci-worker.enc
+          key: ${{ steps.worker-key.outputs.key }}
+      - name: Configure 16 GiB swap
+        run: |
+          set -euo pipefail
+          swap_file=/infra-ci.swap
+          while IFS= read -r previous; do
+            [[ -n "$previous" ]] || continue
+            sudo swapoff "$previous"
+            if [[ -f "$previous" ]]; then sudo rm -- "$previous"; fi
+          done < <(swapon --show=NAME --noheadings --raw)
+          sudo install -m 600 /dev/null "$swap_file"
+          sudo fallocate --length 16G "$swap_file"
+          sudo mkswap "$swap_file" >/dev/null
+          sudo swapon "$swap_file"
+      - &worker
+        name: Run worker
+        id: worker
+        env: &worker-env
+          INPUT_SYSTEM: ${{ matrix.system }}
+          INPUT_SHARDS: ${{ env.SHARDS }}
+          INPUT_SOURCE: ${{ inputs.source || 'main' }}
+          INPUT_HOST: ${{ inputs.host }}
+          INPUT_PACKAGE: ${{ inputs.package }}
+          INPUT_SOURCE_PATH: ${{ github.workspace }}/source
+          INPUT_LOG_PATH: ${{ runner.temp }}/infra-ci-worker.log
+          CI_IDENTITY: ${{ secrets.CI_IDENTITY }}
+          CI_RECIPIENTS: ${{ secrets.CI_RECIPIENTS }}
+          CI_STORAGE: ${{ secrets.CI_STORAGE }}
+          NIX_SIGNING_KEY: ${{ secrets.NIX_SIGNING_KEY }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        # Only progress lines reach stdout; the full log is published privately.
+        run: &worker-run |
+          set +x
+          ulimit -c 0
+          if ! "$RUNNER_TEMP/nix-ci-worker" 2>"$RUNNER_TEMP/infra-ci-stderr.log"; then
+            echo 'error: CI worker failed; see the private log or failure issue' >&2
+            exit 1
+          fi
+      - &issue-token
+        name: Create private issue token
+        id: issue-token
+        if: failure()
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.INFRA_APP_CLIENT_ID }}
+          private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+          permission-issues: write
+      - &report-failure
+        name: Report private failure
+        if: failure()
+        env:
+          SOURCE_TOKEN: ${{ steps.issue-token.outputs.token }}
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          CI_RUNTIME_PATH: *runtime-path
+          API_URL: ${{ github.api_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          SOURCE_REF: ${{ inputs.source || 'main' }}
+          TARGET_HOST: ${{ inputs.host }}
+          TARGET_PACKAGE: ${{ inputs.package }}
+          STEP_STATUS: ${{ toJSON(steps) }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ steps.issue-token.outputs.token }}
+          script: |
+            const runtime = process.env.CI_RUNTIME_PATH + '/ci/scripts/build.cjs';
+            if (require('node:fs').existsSync(runtime)) {
+              await require(runtime).report(core);
+            } else {
+              // Setup can fail before the private runtime is available.
+              const [owner, repo] = process.env.SOURCE_REPOSITORY.split('/');
+              try {
+                const {data} = await github.rest.apps.listReposAccessibleToInstallation({per_page: 2});
+                if (data.total_count !== 1 || data.repositories[0].full_name !== process.env.SOURCE_REPOSITORY ||
+                    data.repositories[0].private !== true) throw new Error();
+                await github.rest.issues.create({owner, repo,
+                  title: `CI #${process.env.RUN_NUMBER}: setup failed`,
+                  body: `Private CI runtime was unavailable. Run: ${process.env.RUN_URL}`});
+              } catch {
+                core.setFailed('Private CI report failed.');
+              }
+            }
+      - &cleanup
+        name: Remove private files
+        if: always()
+        run: |
+          rm -rf -- "$RUNNER_TEMP"/nix-ci-worker* "$RUNNER_TEMP"/infra-ci* \
+            "$GITHUB_WORKSPACE/runtime" "$GITHUB_WORKSPACE/source"
+  build-aarch64:
+    if: github.ref == 'refs/heads/main'
+    name: Build ${{ matrix.system }}/${{ matrix.shard }}
+    strategy:
+      fail-fast: false
+      matrix:
+        system: [aarch64-linux]
+        runner: [ubuntu-26.04-arm]
+        # Keep in sync with SHARDS.
+        shard: [0, 1, 2, 3]
+    runs-on: ${{ matrix.runner }}
+    environment: infra-automation
+    timeout-minutes: 360
+    env: *build-env
+    steps: *build-steps
+  publish-x86_64:
+    needs: build-x86_64
+    # Publish completed shard outputs even when some shards failed.
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.build-x86_64.result != 'skipped' }}
+    name: Publish ${{ matrix.system }}
+    strategy:
+      matrix:
+        system: [x86_64-linux]
+        runner: [ubuntu-26.04]
+    runs-on: ${{ matrix.runner }}
+    environment: infra-automation
+    timeout-minutes: 120
+    env:
+      INPUT_ROLE: publish
+      INPUT_BUILDS: ${{ needs.build-x86_64.result }}
+      JOB_LABEL: publish ${{ matrix.system }}
+    # Publication usually only merges shard catalogs. Nix and the source are
+    # set up only to build the worker or when the worker requests evaluation.
+    steps: &publish-steps
+      - *source-token
+      - *resolve-sources
+      - *runtime-checkout
+      - *worker-key
+      - *worker-restore
+      - name: Install Nix to build the worker
+        if: steps.worker-restore.outputs.cache-hit != 'true'
+        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+        with: *nix-with
+      - *worker-bootstrap
+      - *worker-save
+      - *worker
+      - name: Check out build source for evaluation
+        if: steps.worker.outputs.evaluate == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: *source-checkout-with
+      - name: Install Nix for evaluation
+        if: steps.worker.outputs.evaluate == 'true' && steps.worker-restore.outputs.cache-hit == 'true'
+        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+        with: *nix-with
+      - name: Run worker with evaluation
+        if: steps.worker.outputs.evaluate == 'true'
+        env: *worker-env
+        run: *worker-run
+      - *issue-token
+      - *report-failure
+      - *cleanup
+  publish-aarch64:
+    needs: build-aarch64
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.build-aarch64.result != 'skipped' }}
+    name: Publish ${{ matrix.system }}
+    strategy:
+      matrix:
+        system: [aarch64-linux]
+        runner: [ubuntu-26.04-arm]
+    runs-on: ${{ matrix.runner }}
+    environment: infra-automation
+    timeout-minutes: 120
+    env:
+      INPUT_ROLE: publish
+      INPUT_BUILDS: ${{ needs.build-aarch64.result }}
+      JOB_LABEL: publish ${{ matrix.system }}
+    steps: *publish-steps
