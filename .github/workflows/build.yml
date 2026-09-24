@@ -1,0 +1,265 @@
+name: NixOS cache
+run-name: "Build #${{ github.run_number }} [${{ inputs.request }}]"
+on:
+  workflow_dispatch:
+    inputs:
+      request:
+        description: Request identifier
+        required: true
+        type: string
+      source:
+        description: Source branch, tag, or commit
+        required: true
+        type: string
+      host:
+        description: Host to build (empty builds all targets)
+        required: false
+        type: string
+      package:
+        description: Package attribute on host (empty builds its system)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  packages: write
+
+concurrency:
+  group: infra-ci-publication
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  admit:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.process.outputs.matrix }}
+      helpers: ${{ steps.process.outputs.helpers }}
+      revision: ${{ steps.process.outputs.revision }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          ref: ${{ inputs.source }}
+          ssh-key: ${{ secrets.CI_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+          show-progress: false
+      - &setup-go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          # Keep source-module build outputs out of the public Actions cache.
+          cache: false
+      - &install-nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          # The worker consumes this version's derivation JSON schema.
+          install_url: https://releases.nixos.org/nix/nix-2.34.8/install
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+            sandbox = true
+      - name: Process
+        id: process
+        env:
+          INPUT_REQUEST: ${{ inputs.request }}
+          INPUT_SOURCE: ${{ inputs.source }}
+          INPUT_HOST: ${{ inputs.host }}
+          INPUT_PACKAGE: ${{ inputs.package }}
+          INPUT_SOURCE_PATH: ${{ github.workspace }}/source
+          INPUT_MODE: admit
+          INPUT_SYSTEM: ""
+          CI_IDENTITY: ${{ secrets.CI_IDENTITY }}
+          CI_RECIPIENTS: ${{ secrets.CI_RECIPIENTS }}
+          CI_STORAGE: ${{ secrets.CI_STORAGE }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        # JavaScript actions receive GitHub's job-scoped cache credentials.
+        uses: &process-action actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with: &process
+          script: |
+            const {spawn} = require('node:child_process');
+            const {randomUUID} = require('node:crypto');
+            const workerEnv = {...process.env};
+            delete workerEnv.RUNNER_TRACKING_ID;
+            delete workerEnv['INPUT_GITHUB-TOKEN'];
+            const compileEnv = {...workerEnv, GOTOOLCHAIN: 'local'};
+            for (const name of Object.keys(compileEnv)) {
+              if (/^(ACTIONS_|CI_|REGISTRY_|NIX_SIGNING_KEY$|GITHUB_TOKEN$|GH_TOKEN$)/.test(name)) {
+                delete compileEnv[name];
+              }
+            }
+            if (workerEnv.ACTIONS_RUNTIME_TOKEN) core.setSecret(workerEnv.ACTIONS_RUNTIME_TOKEN);
+            process.umask(0o077);
+            const marker = randomUUID();
+            let child, cancelled;
+            const forward = signal => {
+              cancelled = signal;
+              if (child?.pid) {
+                try { process.kill(-child.pid, signal); }
+                catch (error) { if (error.code !== 'ESRCH') throw error; }
+              }
+            };
+            const interrupt = () => forward('SIGINT');
+            const terminate = () => forward('SIGTERM');
+            process.on('SIGINT', interrupt);
+            process.on('SIGTERM', terminate);
+            const run = (script, env) => new Promise((resolve, reject) => {
+              child = spawn('bash', ['-euo', 'pipefail', '-c', script], {
+                env, stdio: 'inherit', detached: true
+              });
+              child.once('error', reject);
+              child.once('close', code => { child = undefined; resolve(code ?? 1); });
+            });
+            console.log(`::stop-commands::${marker}`);
+            let failure, exitCode = 1;
+            try {
+              const compiled = await run(String.raw`
+                set +x
+                ulimit -c 0
+                exec go -C "$GITHUB_WORKSPACE/source" build -mod=readonly \
+                  -o "$RUNNER_TEMP/nix-ci-worker" github.com/awked-com/nix-ci-worker/cmd/nix-ci-worker \
+                  >"$RUNNER_TEMP/infra-ci-compile.log" 2>&1
+              `, compileEnv);
+              if (cancelled) {
+                failure = 'Worker cancelled.';
+              } else if (compiled !== 0) {
+                failure = 'Worker compilation failed.';
+              } else {
+                exitCode = await run('set +x; ulimit -c 0; exec "$RUNNER_TEMP/nix-ci-worker"', workerEnv);
+                if (exitCode !== 0) failure = 'Worker failed.';
+              }
+            } catch {
+              failure = 'Worker execution failed.';
+            } finally {
+              console.log(`\n::${marker}::`);
+              process.removeListener('SIGINT', interrupt);
+              process.removeListener('SIGTERM', terminate);
+            }
+            if (failure) {
+              core.setFailed(failure);
+              process.exitCode = exitCode;
+            }
+            if (cancelled) process.exitCode = cancelled === 'SIGINT' ? 130 : 143;
+  build:
+    needs: admit
+    name: Build ${{ matrix.system }}
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJSON(needs.admit.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    steps:
+      - &setup-swap
+        id: setup-swap
+        name: Configure 16 GiB swap
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -x
+          old_swap=$(swapon --show=NAME --noheadings --raw)
+          swap_file=/infra-ci.swap
+          if [[ -e "$swap_file" ]]; then
+            echo 'error: replacement swap file already exists' >&2
+            exit 1
+          fi
+          while IFS= read -r previous; do
+            [[ -n "$previous" ]] || continue
+            sudo swapoff --verbose "$previous"
+            if [[ -f "$previous" ]]; then
+              sudo rm --verbose -- "$previous"
+            fi
+          done <<< "$old_swap"
+          sudo install --verbose -m 600 /dev/null "$swap_file"
+          sudo fallocate --verbose --length 16G "$swap_file"
+          sudo mkswap "$swap_file"
+          sudo swapon --verbose "$swap_file"
+
+      - &checkout-source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          ref: ${{ needs.admit.outputs.revision }}
+          ssh-key: ${{ secrets.CI_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+          show-progress: false
+      - *setup-go
+      - &retry-nix-daemon
+        name: Retry macOS Nix daemon startup
+        if: runner.os == 'macOS'
+        run: |
+          wrapper="$RUNNER_TEMP/nix-installer-sudo"
+          cat > "$wrapper" <<'EOF'
+          #!/bin/bash
+          if [[ "$*" == "env launchctl kickstart -k system/org.nixos.nix-daemon" ]]; then
+            for attempt in {1..10}; do
+              sudo "$@" && exit 0
+              sleep 0.5
+            done
+          fi
+          exec sudo "$@"
+          EOF
+          chmod +x "$wrapper"
+          echo "NIX_BECOME=$wrapper" >> "$GITHUB_ENV"
+      - *install-nix
+      - name: Process
+        id: process
+        env:
+          INPUT_REQUEST: ${{ inputs.request }}
+          INPUT_SOURCE: ${{ inputs.source }}
+          INPUT_HOST: ${{ inputs.host }}
+          INPUT_PACKAGE: ${{ inputs.package }}
+          INPUT_SOURCE_PATH: ${{ github.workspace }}/source
+          INPUT_MODE: build
+          INPUT_SYSTEM: ${{ matrix.system }}
+          CI_IDENTITY: ${{ secrets.CI_IDENTITY }}
+          CI_RECIPIENTS: ${{ secrets.CI_RECIPIENTS }}
+          NIX_SIGNING_KEY: ${{ secrets.NIX_SIGNING_KEY }}
+          CI_STORAGE: ${{ secrets.CI_STORAGE }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        uses: *process-action
+        with: *process
+  builder:
+    needs: admit
+    name: Builder ${{ matrix.system }}/${{ matrix.builder }}
+    continue-on-error: true
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.admit.outputs.helpers) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    steps:
+      - *setup-swap
+      - *checkout-source
+      - *setup-go
+      - *retry-nix-daemon
+      - *install-nix
+      - name: Process
+        id: process
+        env:
+          INPUT_REQUEST: ${{ inputs.request }}
+          INPUT_SOURCE: ${{ inputs.source }}
+          INPUT_HOST: ${{ inputs.host }}
+          INPUT_PACKAGE: ${{ inputs.package }}
+          INPUT_SOURCE_PATH: ${{ github.workspace }}/source
+          INPUT_MODE: builder
+          INPUT_BUILDER: ${{ matrix.builder }}
+          INPUT_SYSTEM: ${{ matrix.system }}
+          CI_IDENTITY: ${{ secrets.CI_IDENTITY }}
+          CI_RECIPIENTS: ${{ secrets.CI_RECIPIENTS }}
+          CI_STORAGE: ${{ secrets.CI_STORAGE }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        uses: *process-action
+        with: *process
