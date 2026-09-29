@@ -1,9 +1,7 @@
 # Infra CI workflow
 
-This repository contains the public
-[GitHub Actions workflow](.github/workflows/build.yml) for
-[nix-ci-worker](https://github.com/awked-com/nix-ci-worker). Edit and push the
-workflow directly in this repository.
+Public [GitHub Actions workflow](.github/workflows/build.yml) for
+[nix-ci-worker](https://github.com/awked-com/nix-ci-worker).
 
 ## Configure and run
 
