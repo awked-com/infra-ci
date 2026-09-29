@@ -29,14 +29,10 @@ coordinator and two helpers. Retry all build jobs together for a new helper pool
 a coordinator retried alone can finish locally. Rerunning admission may resolve
 its source ref again; retrying only later jobs retains the admitted commit.
 
-The workflow pins its GitHub actions, Go toolchain, and Nix installer. It
-compiles the worker from the checked-out source module's pinned dependency.
-Keep the Nix version compatible with the worker's derivation JSON schema.
-Linux build jobs configure 16 GiB swap before checkout; admission and macOS
-skip swap setup. The workflow removes checkout credentials, disables the public
-Go Actions cache, and writes private compiler diagnostics only to a runner-local
-file. Worker steps receive automatic job-scoped Actions cache credentials from
-the JavaScript action. Helpers never receive the final cache signing key.
+The worker is compiled from the source module's pinned dependency. Keep the Nix
+version compatible with its derivation JSON schema. Launch it through the
+JavaScript action for job-scoped Actions cache credentials. Helpers must never
+receive the final cache signing key.
 
 Workflow files, source refs, selections, and Actions logs are public. GHCR
 results and cache payloads and Actions coordination messages are encrypted.

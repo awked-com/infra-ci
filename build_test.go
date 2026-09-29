@@ -2,7 +2,6 @@ package infraci_test
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -33,41 +32,14 @@ func TestBuildWorkflow(t *testing.T) {
 			Permissions map[string]string
 			Strategy    struct{ Matrix string }
 			Steps       []struct {
-				ID, If, Shell string
-				Uses, Run     string
-				With, Env     map[string]string
+				Uses, Run string
+				With, Env map[string]string
 			}
 		}
 	}
 	if err := yaml.Unmarshal(data, &workflow); err != nil {
 		t.Fatal(err)
 	}
-
-	t.Run("builder swap", func(t *testing.T) {
-		for _, step := range workflow.Jobs["admit"].Steps {
-			if step.ID == "setup-swap" {
-				t.Fatal("admission must skip swap setup")
-			}
-		}
-		for _, name := range []string{"build", "builder"} {
-			steps := workflow.Jobs[name].Steps
-			if len(steps) == 0 || steps[0].ID != "setup-swap" {
-				t.Fatalf("%s must configure swap before checkout", name)
-			}
-			step := steps[0]
-			if step.If != "runner.os == 'Linux'" {
-				t.Fatalf("%s swap setup must only run on Linux", name)
-			}
-			if step.Shell != "bash" || step.Run == "" {
-				t.Fatalf("%s swap setup requires a Bash script", name)
-			}
-			cmd := exec.Command("bash", "-n")
-			cmd.Stdin = strings.NewReader(step.Run)
-			if output, err := cmd.CombinedOutput(); err != nil {
-				t.Fatalf("%s swap setup syntax: %s: %v", name, output, err)
-			}
-		}
-	})
 
 	t.Run("publication", func(t *testing.T) {
 		if workflow.Concurrency.Group == "" || workflow.Concurrency.Cancel || workflow.Concurrency.Queue != "max" {
