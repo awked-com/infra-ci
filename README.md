@@ -18,14 +18,11 @@ access**. Configure these Actions secrets:
 | `CI_STORAGE` | GHCR package configuration |
 | `NIX_SIGNING_KEY` | Final Nix cache signing key, coordinators only |
 
-Dispatch `build.yml` through GitHub Actions with `request` (32 lowercase hex
-characters) and `source` (branch, tag, or commit).
-Optional `host` and `package` select a host system or package attribute; an empty
-selection builds all configured targets. Admission resolves the source to a
-commit and emits coordinator and helper matrices. Each platform runs one
-coordinator and two helpers. Retry all build jobs together for a new helper pool;
-a coordinator retried alone can finish locally. Rerunning admission may resolve
-its source ref again; retrying only later jobs retains the admitted commit.
+Dispatch [build.yml](.github/workflows/build.yml) through GitHub Actions.
+Admission resolves the source to a commit. Retry all build jobs together for a
+new helper pool; a coordinator retried alone can finish locally. Rerunning
+admission may resolve its source ref again; retrying only later jobs retains the
+admitted commit.
 
 The worker is compiled from the source module's pinned dependency. Keep the Nix
 version compatible with its derivation JSON schema. Launch it through the
