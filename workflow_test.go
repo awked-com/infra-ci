@@ -182,7 +182,7 @@ new AsyncFunction('require', 'core', `+string(encoded)+`)(require, core).catch((
 			if !reflect.DeepEqual(compiled.Environment, map[string]string{"GOTOOLCHAIN": "local"}) {
 				t.Fatal("compiler inherited worker credentials or did not use the installed Go toolchain")
 			}
-			if !reflect.DeepEqual(compiled.Arguments, []string{"-C", filepath.Join(root, "source"), "build", "-mod=readonly", "-o", filepath.Join(root, "nix-ci-worker"), "github.com/awked-com/nix-ci-worker/cmd/nix-ci-worker"}) {
+			if len(compiled.Arguments) != 2 || compiled.Arguments[0] != "install" || !regexp.MustCompile(`^github.com/awked-com/nix-ci-worker/cmd/nix-ci-worker@v0\.0\.0-[0-9]{14}-[a-f0-9]{12}$`).MatchString(compiled.Arguments[1]) {
 				t.Fatalf("unexpected compiler arguments: %q", compiled.Arguments)
 			}
 			if strings.HasPrefix(test.mode, "compile-") {

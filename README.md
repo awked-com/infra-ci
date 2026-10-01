@@ -5,9 +5,9 @@ Public [GitHub Actions workflow](.github/workflows/build.yml) for
 
 ## Configure and run
 
-Grant this repository's Actions permission to read Actions metadata and write
-packages. The GHCR package also needs **Admin** access under **Manage Actions
-access**. Configure these Actions secrets:
+Grant this repository’s Actions permission to write packages and grant the
+workflow repository **Write** access under the GHCR package’s
+**Manage Actions access** settings. Configure these Actions secrets:
 
 | Secret | Purpose |
 | --- | --- |
@@ -24,10 +24,13 @@ new helper pool; a coordinator retried alone can finish locally. Rerunning
 admission may resolve its source ref again; retrying only later jobs retains the
 admitted commit.
 
-The worker is compiled from the source module's pinned dependency. Keep the Nix
-version compatible with its derivation JSON schema. Launch it through the
+The workflow pins the worker independently of the requested source revision, so
+building historical source cannot restore an older cache-deletion policy. Keep
+the Nix version compatible with the worker’s derivation JSON schema. Launch it through the
 JavaScript action for job-scoped Actions cache credentials. Helpers must never
 receive the final cache signing key.
+
+Cache generations, results, and helper snapshots are retained permanently.
 
 Workflow files, source refs, selections, and Actions logs are public. GHCR
 results and cache payloads and Actions coordination messages are encrypted.
