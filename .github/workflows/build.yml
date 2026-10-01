@@ -121,7 +121,7 @@ jobs:
                 set +x
                 ulimit -c 0
                 export GOBIN="$RUNNER_TEMP"
-                exec go install github.com/awked-com/nix-ci-worker/cmd/nix-ci-worker@v0.0.0-20261001005940-6077e0615110 \
+                exec go install github.com/awked-com/nix-ci-worker/cmd/nix-ci-worker@v0.0.0-20261001011049-a9914527f894 \
                   >"$RUNNER_TEMP/infra-ci-compile.log" 2>&1
               `, compileEnv);
               if (cancelled) {
@@ -149,7 +149,7 @@ jobs:
     name: Build ${{ matrix.system }}
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 2
       matrix: ${{ fromJSON(needs.admit.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
@@ -189,23 +189,6 @@ jobs:
           path: source
           show-progress: false
       - *setup-go
-      - &retry-nix-daemon
-        name: Retry macOS Nix daemon startup
-        if: runner.os == 'macOS'
-        run: |
-          wrapper="$RUNNER_TEMP/nix-installer-sudo"
-          cat > "$wrapper" <<'EOF'
-          #!/bin/bash
-          if [[ "$*" == "env launchctl kickstart -k system/org.nixos.nix-daemon" ]]; then
-            for attempt in {1..10}; do
-              sudo "$@" && exit 0
-              sleep 0.5
-            done
-          fi
-          exec sudo "$@"
-          EOF
-          chmod +x "$wrapper"
-          echo "NIX_BECOME=$wrapper" >> "$GITHUB_ENV"
       - *install-nix
       - name: Process
         id: process
@@ -242,7 +225,6 @@ jobs:
       - *setup-swap
       - *checkout-source
       - *setup-go
-      - *retry-nix-daemon
       - *install-nix
       - name: Process
         id: process

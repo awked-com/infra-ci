@@ -19,7 +19,8 @@ workflow repository **Write** access under the GHCR package’s
 | `NIX_SIGNING_KEY` | Final Nix cache signing key, coordinators only |
 
 Dispatch [build.yml](.github/workflows/build.yml) through GitHub Actions.
-Admission resolves the source to a commit. Retry all build jobs together for a
+Admission resolves the source to a commit. CI runs on x86_64 and ARM64 Linux,
+with one coordinator and three helpers per platform. Retry all build jobs together for a
 new helper pool; a coordinator retried alone can finish locally. Rerunning
 admission may resolve its source ref again; retrying only later jobs retains the
 admitted commit.
