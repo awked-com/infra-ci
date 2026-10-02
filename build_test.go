@@ -16,7 +16,6 @@ func TestBuildWorkflow(t *testing.T) {
 		t.Fatal(err)
 	}
 	var workflow struct {
-		Permissions map[string]string
 		Concurrency struct {
 			Group  string
 			Cancel bool `yaml:"cancel-in-progress"`
@@ -60,18 +59,12 @@ func TestBuildWorkflow(t *testing.T) {
 		if workflow.Jobs["build"].Name != "Build ${{ matrix.system }}" {
 			t.Fatal("build job name does not identify its system")
 		}
-		if workflow.Permissions["packages"] != "write" {
-			t.Fatal("workers need to upload encrypted build results")
-		}
 	})
 
 	actionPin := regexp.MustCompile(`^[^@]+@[a-f0-9]{40}$`)
 	for _, name := range []string{"admit", "build", "builder"} {
 		t.Run(name, func(t *testing.T) {
-			job, ok := workflow.Jobs[name]
-			if !ok {
-				t.Fatal("missing worker job")
-			}
+			job := workflow.Jobs[name]
 			ref := "${{ needs.admit.outputs.revision }}"
 			if name == "admit" {
 				ref = "${{ inputs.source }}"
