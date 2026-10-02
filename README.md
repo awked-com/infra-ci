@@ -19,19 +19,14 @@ workflow repository **Write** access under the GHCR package’s
 | `NIX_SIGNING_KEY` | Final Nix cache signing key, coordinators only |
 
 Dispatch [build.yml](.github/workflows/build.yml) through GitHub Actions.
-Admission resolves the source to a commit. CI runs on x86_64 and ARM64 Linux,
-with one coordinator and three helpers per platform. Retry all build jobs together for a
+Admission resolves the source to a commit. Retry all build jobs together for a
 new helper pool; a coordinator retried alone can finish locally. Rerunning
-admission may resolve its source ref again; retrying only later jobs retains the
-admitted commit.
+admission resolves its source ref again; later jobs retain the admitted commit.
 
-The workflow pins the worker independently of the requested source revision, so
-building historical source cannot restore an older cache-deletion policy. Keep
-the Nix version compatible with the worker’s derivation JSON schema. Launch it through the
-JavaScript action for job-scoped Actions cache credentials. Helpers must never
-receive the final cache signing key.
-
-Cache generations, results, and helper snapshots are retained permanently.
+Keep the worker pin independent of the source revision and Nix compatible with
+the worker’s derivation JSON schema. The JavaScript launcher supplies job-scoped
+Actions cache credentials. Helpers must never receive the final signing key.
+See the worker’s [build and retention behavior](https://github.com/awked-com/nix-ci-worker#run-builds).
 
 Workflow files, source refs, selections, and Actions logs are public. GHCR
 results and cache payloads and Actions coordination messages are encrypted.

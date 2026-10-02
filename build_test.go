@@ -16,19 +16,19 @@ func TestBuildWorkflow(t *testing.T) {
 		t.Fatal(err)
 	}
 	var workflow struct {
+		Permissions map[string]string
 		Concurrency struct {
 			Group  string
 			Cancel bool `yaml:"cancel-in-progress"`
 			Queue  string
 		}
 		Jobs map[string]struct {
-			Needs       any
-			Name        string
-			RunsOn      string `yaml:"runs-on"`
-			Outputs     map[string]string
-			Permissions map[string]string
-			Strategy    struct{ Matrix string }
-			Steps       []struct {
+			Needs    any
+			Name     string
+			RunsOn   string `yaml:"runs-on"`
+			Outputs  map[string]string
+			Strategy struct{ Matrix string }
+			Steps    []struct {
 				Uses, Run string
 				With, Env map[string]string
 			}
@@ -60,8 +60,8 @@ func TestBuildWorkflow(t *testing.T) {
 		if workflow.Jobs["build"].Name != "Build ${{ matrix.system }}" {
 			t.Fatal("build job name does not identify its system")
 		}
-		if workflow.Jobs["builder"].Permissions["packages"] != "write" {
-			t.Fatal("helpers need to upload encrypted build results")
+		if workflow.Permissions["packages"] != "write" {
+			t.Fatal("workers need to upload encrypted build results")
 		}
 	})
 

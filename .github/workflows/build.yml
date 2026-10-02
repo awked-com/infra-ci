@@ -121,7 +121,7 @@ jobs:
                 set +x
                 ulimit -c 0
                 export GOBIN="$RUNNER_TEMP"
-                exec go install github.com/awked-com/nix-ci-worker/cmd/nix-ci-worker@v0.0.0-20261001132559-113f378d5b78 \
+                exec go install github.com/awked-com/nix-ci-worker/cmd/nix-ci-worker@v0.0.0-20261002170955-a074b18284b3 \
                   >"$RUNNER_TEMP/infra-ci-compile.log" 2>&1
               `, compileEnv);
               if (cancelled) {
@@ -149,15 +149,12 @@ jobs:
     name: Build ${{ matrix.system }}
     strategy:
       fail-fast: false
-      max-parallel: 2
       matrix: ${{ fromJSON(needs.admit.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     steps:
       - &setup-swap
-        id: setup-swap
         name: Configure 16 GiB swap
-        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -x
@@ -212,12 +209,8 @@ jobs:
     needs: admit
     name: Builder ${{ matrix.system }}/${{ matrix.builder }}
     continue-on-error: true
-    permissions:
-      contents: read
-      packages: write
     strategy:
       fail-fast: false
-      max-parallel: 6
       matrix: ${{ fromJSON(needs.admit.outputs.helpers) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
