@@ -121,7 +121,7 @@ jobs:
                 set +x
                 ulimit -c 0
                 export GOBIN="$RUNNER_TEMP"
-                exec go install github.com/awked-com/nix-ci-worker/cmd/nix-ci-worker@v0.0.0-20261002170955-a074b18284b3 \
+                exec go install github.com/awked-com/nix-ci-worker/cmd/nix-ci-worker@v0.0.0-20261002171723-8f1b8cfcee14 \
                   >"$RUNNER_TEMP/infra-ci-compile.log" 2>&1
               `, compileEnv);
               if (cancelled) {
