@@ -3,7 +3,7 @@
 Public [build workflow](.github/workflows/build.yml) for
 [nix-ci-worker](https://github.com/awked-com/nix-ci-worker).
 
-## Setup
+## Configure and run
 
 Grant this repository's Actions permission to write packages and **Write** access
 under the GHCR package's **Manage Actions access** settings. Configure:
@@ -39,7 +39,7 @@ Actions coordination messages are encrypted. Never expose private source,
 secrets, diagnostics, or source-derived details in this repository or its output.
 Build subprocesses receive neither the App key nor write tokens.
 
-## Maintenance
+## Private source maintenance
 
 [Maintenance](.github/workflows/infra-maintenance.yml) checks private `main` daily
 at 03:17 UTC and updates Nix inputs Mondays at 03:43 UTC. Manual runs accept
@@ -59,7 +59,7 @@ Read tokens are scoped to clone steps; branch-write tokens are issued after the
 refresh. Publication jobs never execute private source. Do not pass private pull
 request identifiers through the public build inputs.
 
-## Development
+## Repository checks and updates
 
 With Go and Node.js installed, run `go test -race ./...` and `go vet ./...`.
 [Repository CI](.github/workflows/ci.yml) also runs actionlint; it needs no private
