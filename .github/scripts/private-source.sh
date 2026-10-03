@@ -21,6 +21,22 @@ run() {
     env -i HOME="$HOME" PATH="$PATH" USER="${USER:-runner}" \
       TMPDIR="${RUNNER_TEMP:-/tmp}" GOTOOLCHAIN=local "$@"
   ) >"$log" 2>&1; then
+    # Remove this diagnostic handoff after the Linux Go failure is identified
+    # and the corrected maintenance check passes.
+    if [[ $phase == 'go tests' && ${INFRA_GO_DIAGNOSTIC:-} == 1 && -n ${RUNNER_TEMP:-} ]]; then
+      diagnostic="$RUNNER_TEMP/infra-go-failures.json"
+      if ! jq -Rn '
+        [inputs | fromjson? |
+          select(type == "object" and .Action == "fail" and
+            (.Package | type == "string") and
+            (.Package | test("^[A-Za-z0-9_.@/-]{1,240}$")) and
+            ((.Test == null) or
+              ((.Test | type == "string") and (.Test | test("^[A-Za-z0-9_./-]{1,240}$"))))) |
+          {package: .Package, test: (.Test // null)}] | unique | .[:20]
+      ' "$log" >"$diagnostic" 2>/dev/null; then
+        rm -f -- "$diagnostic"
+      fi
+    fi
     echo "error: private $phase failed; reproduce locally" >&2
     exit 1
   fi
@@ -30,7 +46,11 @@ if [[ $operation == update ]]; then
   run 'nix input update' nix flake update
   exit 0
 fi
-run 'go tests' go test -race ./...
+if [[ ${INFRA_GO_DIAGNOSTIC:-} == 1 ]]; then
+  run 'go tests' go test -race -json ./...
+else
+  run 'go tests' go test -race ./...
+fi
 run 'go vet' go vet ./...
 run 'go build' go build ./...
 run 'nix flake check' nix flake check

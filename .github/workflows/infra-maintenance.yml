@@ -163,7 +163,57 @@ jobs:
             accept-flake-config = false
             sandbox = true
       - name: Validate private source
+        id: validate
+        env:
+          INFRA_GO_DIAGNOSTIC: '1'
         run: bash .github/scripts/private-source.sh check source
+      # Remove these steps after the Linux Go failure is identified and the
+      # corrected maintenance check passes.
+      - name: Find private Go test identifiers
+        if: failure() && steps.validate.outcome == 'failure'
+        id: go-diagnostic
+        run: |
+          set -euo pipefail
+          if [[ -s "$RUNNER_TEMP/infra-go-failures.json" ]] &&
+             jq -e 'type == "array" and length > 0' \
+               "$RUNNER_TEMP/infra-go-failures.json" >/dev/null 2>&1; then
+            echo 'present=true' >>"$GITHUB_OUTPUT"
+          fi
+      - name: Create private diagnostic token
+        if: failure() && steps.go-diagnostic.outputs.present == 'true'
+        id: diagnostic-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.INFRA_APP_CLIENT_ID }}
+          private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+          permission-checks: write
+      - name: Report identifiers to private infra check
+        if: failure() && steps.go-diagnostic.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ steps.diagnostic-token.outputs.token }}
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          request=$(mktemp)
+          error_log=$(mktemp)
+          trap 'rm -f -- "$request" "$error_log" "$RUNNER_TEMP/infra-go-failures.json"' EXIT
+          revision=$(git -C source rev-parse HEAD 2>/dev/null)
+          if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'error: could not report private Go test identifiers' >&2
+            exit 1
+          fi
+          jq -n --arg sha "$revision" \
+            --slurpfile failures "$RUNNER_TEMP/infra-go-failures.json" \
+            '{name:"infra-ci/go-test-diagnostic",head_sha:$sha,status:"completed",conclusion:"neutral",output:{title:"Go test failure",summary:"Failing package and test names from the private maintenance run.",text:($failures[0] | map(if .test == null then .package else "\(.package): \(.test)" end) | join("\n"))}}' >"$request"
+          if ! gh api -X POST "repos/$SOURCE_REPOSITORY/check-runs" \
+            --input "$request" >/dev/null 2>"$error_log"; then
+            echo 'error: could not report private Go test identifiers' >&2
+            exit 1
+          fi
 
   report:
     needs: [preflight, check]
