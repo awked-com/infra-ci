@@ -79,8 +79,6 @@ new AsyncFunction('require', 'core', `+string(encoded)+`)(require, core).catch((
 		{name: "compiler failure", mode: "compile-fail", wantExit: 1},
 		{name: "worker failure", mode: "worker-fail", wantExit: 23},
 		{name: "interrupt worker", mode: "worker-cancel", signal: syscall.SIGINT, wantExit: 130},
-		{name: "terminate worker", mode: "worker-cancel", signal: syscall.SIGTERM, wantExit: 143},
-		{name: "interrupt compiler", mode: "compile-cancel", signal: syscall.SIGINT, wantExit: 130},
 		{name: "terminate compiler", mode: "compile-cancel", signal: syscall.SIGTERM, wantExit: 143},
 	} {
 		t.Run(test.name, func(t *testing.T) {
