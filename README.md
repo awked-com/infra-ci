@@ -12,7 +12,7 @@ workflow repository **Write** access under the GHCR package’s
 | Secret | Purpose |
 | --- | --- |
 | `CI_SOURCE_REPOSITORY` | Private source repository in `OWNER/NAME` form |
-| `CI_DEPLOY_KEY` | Read-only SSH deploy key for that source |
+| `CI_DEPLOY_KEY` | Read-write SSH deploy key for that source |
 | `CI_IDENTITY` | Age identity for encrypted inputs |
 | `CI_RECIPIENTS` | Age recipients for encrypted outputs |
 | `CI_STORAGE` | GHCR package configuration |
