@@ -37,14 +37,14 @@ jobs:
       - name: Validate configuration and operation
         id: mode
         env:
-          APP_ID: ${{ vars.INFRA_APP_ID }}
+          APP_CLIENT_ID: ${{ vars.INFRA_APP_CLIENT_ID }}
           SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
           SCHEDULE: ${{ github.event.schedule }}
           OPERATION: ${{ inputs.operation }}
         run: |
           set +x
           set -euo pipefail
-          if [[ -z "$APP_ID" ||
+          if [[ -z "$APP_CLIENT_ID" ||
                 ! "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
             echo 'error: infra maintenance credentials are not configured' >&2
             exit 1
@@ -65,7 +65,7 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.INFRA_APP_ID }}
+          client-id: ${{ vars.INFRA_APP_CLIENT_ID }}
           private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           permission-contents: read
@@ -135,7 +135,7 @@ jobs:
         id: source-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.INFRA_APP_ID }}
+          client-id: ${{ vars.INFRA_APP_CLIENT_ID }}
           private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           permission-contents: read
@@ -176,7 +176,7 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.INFRA_APP_ID }}
+          client-id: ${{ vars.INFRA_APP_CLIENT_ID }}
           private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           permission-contents: read
@@ -274,7 +274,7 @@ jobs:
         id: write-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.INFRA_APP_ID }}
+          client-id: ${{ vars.INFRA_APP_CLIENT_ID }}
           private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           permission-contents: write
@@ -332,7 +332,7 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.INFRA_APP_ID }}
+          client-id: ${{ vars.INFRA_APP_CLIENT_ID }}
           private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           permission-contents: read

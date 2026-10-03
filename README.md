@@ -26,13 +26,14 @@ workflow repository **Write** access under the GHCR package’s
 
 Create the organization-owned GitHub App `awked-infra-ci`, installed **only** on
 the private source repository, with repository permissions **Contents: write**,
-**Pull requests: write**, and **Checks: write**. Set the `INFRA_APP_ID`
-repository variable to its App ID. Use the `infra-automation` environment,
-restricted to `main`, and set its `INFRA_APP_PRIVATE_KEY` environment secret
-to the App's private key. `infra ci sync` manages the build secrets in the
-table; configure the App variable and environment secret separately. Builds
-request short-lived Contents: read tokens for source checkout. The App key
-and write tokens are not passed to build subprocesses.
+**Pull requests: write**, and **Checks: write**. Set the
+`INFRA_APP_CLIENT_ID` repository variable to its client ID. Use the
+`infra-automation` environment, restricted to `main`, and set its
+`INFRA_APP_PRIVATE_KEY` environment secret to the App's private key.
+`infra ci sync` manages the build secrets in the table; configure the App
+variable and environment secret separately. Builds request short-lived
+Contents: read tokens for source checkout. The App key and write tokens are not
+passed to build subprocesses.
 
 Dispatch [build.yml](.github/workflows/build.yml) through GitHub Actions.
 Admission resolves the source to a commit. Retry all build jobs together for a
