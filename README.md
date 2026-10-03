@@ -26,7 +26,6 @@ admission resolves its source ref again; later jobs retain the admitted commit.
 Keep the worker pin independent of the source revision and Nix compatible with
 the worker’s derivation JSON schema. The JavaScript launcher supplies job-scoped
 Actions cache credentials. Helpers must never receive the final signing key.
-See the worker’s [build and retention behavior](https://github.com/awked-com/nix-ci-worker#run-builds).
 
 Workflow files, source refs, selections, and Actions logs are public. GHCR
 results and cache payloads and Actions coordination messages are encrypted.
