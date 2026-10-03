@@ -1,0 +1,358 @@
+name: Infra maintenance
+run-name: 'Infra maintenance #${{ github.run_number }}'
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Check main or update Nix flake inputs
+        required: true
+        default: check
+        type: choice
+        options: [check, update]
+  schedule:
+    - cron: '17 3 * * *'
+    - cron: '43 3 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infra-maintenance
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    environment: infra-automation
+    timeout-minutes: 10
+    outputs:
+      update: ${{ steps.mode.outputs.update }}
+      proceed: ${{ steps.candidates.outputs.proceed }}
+    steps:
+      - name: Require main
+        if: github.ref != 'refs/heads/main'
+        run: exit 1
+      - name: Validate configuration and operation
+        id: mode
+        env:
+          APP_ID: ${{ vars.INFRA_APP_ID }}
+          APP_KEY: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY }}
+          SCHEDULE: ${{ github.event.schedule }}
+          OPERATION: ${{ inputs.operation }}
+        run: |
+          set +x
+          set -euo pipefail
+          if [[ -z "$APP_ID" || -z "$APP_KEY" || -z "$DEPLOY_KEY" ||
+                ! "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo 'error: infra maintenance credentials are not configured' >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$OPERATION" == check || "$OPERATION" == update ]] || exit 1
+          elif [[ "$GITHUB_EVENT_NAME" == schedule ]]; then
+            [[ "$SCHEDULE" == '17 3 * * *' || "$SCHEDULE" == '43 3 * * 1' ]] || exit 1
+          else
+            exit 1
+          fi
+          update=false
+          if [[ "$SCHEDULE" == '43 3 * * 1' || "$OPERATION" == update ]]; then
+            update=true
+          fi
+          echo "update=$update" >>"$GITHUB_OUTPUT"
+      - name: Verify GitHub App access
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.INFRA_APP_ID }}
+          private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+          permission-pull-requests: write
+          permission-checks: write
+      - name: Verify installation scope
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          response=$(mktemp)
+          error_log=$(mktemp)
+          trap 'rm -f -- "$response" "$error_log"' EXIT
+          if ! gh api 'installation/repositories?per_page=2' >"$response" 2>"$error_log" ||
+             ! jq -e --arg repository "$SOURCE_REPOSITORY" \
+               '.total_count == 1 and .repositories[0].full_name == $repository' \
+               "$response" >/dev/null 2>&1; then
+            echo 'error: infra App installation scope is invalid' >&2
+            exit 1
+          fi
+      - name: Avoid duplicate update requests
+        id: candidates
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          UPDATE: ${{ steps.mode.outputs.update }}
+        run: |
+          set +x
+          set -euo pipefail
+          if [[ "$UPDATE" != true ]]; then
+            echo 'proceed=true' >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          umask 077
+          existing=$(mktemp)
+          error_log=$(mktemp)
+          trap 'rm -f -- "$existing" "$error_log"' EXIT
+          if ! gh api --paginate "repos/$SOURCE_REPOSITORY/pulls?state=open&per_page=100" \
+            --jq '.[] | select(.base.ref == "main" and .head.repo.full_name == .base.repo.full_name and (.head.ref | startswith("codex/nix-inputs-"))) | .number' \
+            >"$existing" 2>"$error_log"; then
+            echo 'error: could not inspect existing update requests' >&2
+            exit 1
+          fi
+          if [[ -s "$existing" ]]; then
+            echo 'proceed=false' >>"$GITHUB_OUTPUT"
+          else
+            echo 'proceed=true' >>"$GITHUB_OUTPUT"
+          fi
+
+  check:
+    needs: preflight
+    if: needs.preflight.outputs.update == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    outputs:
+      revision_hash: ${{ steps.revision.outputs.revision_hash }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Fetch private source
+        env:
+          CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          CI_DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY }}
+        run: bash .github/scripts/source-git.sh clone source
+      - name: Record checked revision
+        id: revision
+        run: |
+          set -euo pipefail
+          revision=$(git -C source rev-parse HEAD 2>/dev/null)
+          fingerprint=$(printf '%s' "$revision" | sha256sum | cut -d ' ' -f1)
+          echo "revision_hash=$fingerprint" >>"$GITHUB_OUTPUT"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          install_url: https://releases.nixos.org/nix/nix-2.34.8/install
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+            sandbox = true
+      - name: Validate private source
+        run: bash .github/scripts/private-source.sh check source
+
+  report:
+    needs: [preflight, check]
+    if: always() && needs.preflight.result == 'success' && needs.check.outputs.revision_hash != ''
+    runs-on: ubuntu-24.04
+    environment: infra-automation
+    timeout-minutes: 10
+    steps:
+      - name: Create check token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.INFRA_APP_ID }}
+          private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+          permission-checks: write
+      - name: Report checked revision
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          REVISION_HASH: ${{ needs.check.outputs.revision_hash }}
+          CHECK_RESULT: ${{ needs.check.result }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          request=$(mktemp)
+          error_log=$(mktemp)
+          trap 'rm -f -- "$request" "$error_log"' EXIT
+          if ! revision=$(gh api "repos/$SOURCE_REPOSITORY/git/ref/heads/main" \
+            --jq '.object.sha' 2>"$error_log") ||
+             [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ $(printf '%s' "$revision" | sha256sum | cut -d ' ' -f1) != "$REVISION_HASH" ]]; then
+            echo 'error: private main changed during validation; rerun the check' >&2
+            exit 1
+          fi
+          conclusion=failure
+          if [[ "$CHECK_RESULT" == success ]]; then conclusion=success; fi
+          jq -n --arg sha "$revision" --arg conclusion "$conclusion" \
+            --arg url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{name:"infra-ci/verification",head_sha:$sha,status:"completed",conclusion:$conclusion,details_url:$url,output:{title:"Infra verification",summary:"Reproduce failed checks locally; public logs omit private diagnostics."}}' >"$request"
+          if ! gh api -X POST "repos/$SOURCE_REPOSITORY/check-runs" \
+            --input "$request" >/dev/null 2>"$error_log"; then
+            echo 'error: could not report private source result' >&2
+            exit 1
+          fi
+
+  update:
+    needs: preflight
+    if: needs.preflight.outputs.update == 'true' && needs.preflight.outputs.proceed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    outputs:
+      changed: ${{ steps.commit.outputs.changed }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Fetch private source
+        env:
+          CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          CI_DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY }}
+        run: bash .github/scripts/source-git.sh clone source
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          install_url: https://releases.nixos.org/nix/nix-2.34.8/install
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+            sandbox = true
+      - name: Refresh private inputs
+        run: bash .github/scripts/private-source.sh update source
+      - name: Prepare update commit
+        id: commit
+        run: |
+          set +x
+          set -euo pipefail
+          if ! status=$(git -C source status --porcelain --untracked-files=all 2>/dev/null); then
+            echo 'error: could not inspect update' >&2
+            exit 1
+          fi
+          if [[ -z "$status" ]]; then
+            echo 'changed=false' >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$status" != ' M flake.lock' ]] ||
+             ! git -C source diff --check >/dev/null 2>&1; then
+            echo 'error: update changed unexpected files' >&2
+            exit 1
+          fi
+          git -C source -c core.hooksPath=/dev/null add -- flake.lock >/dev/null 2>&1
+          if ! git -C source -c core.hooksPath=/dev/null \
+            -c user.name=infra-ci -c user.email=infra-ci@users.noreply.github.com \
+            commit --quiet -m 'Update Nix flake inputs' >/dev/null 2>&1; then
+            echo 'error: could not prepare update commit' >&2
+            exit 1
+          fi
+          echo 'changed=true' >>"$GITHUB_OUTPUT"
+      - name: Publish update branch
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          CI_DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY }}
+        run: |
+          set +x
+          branch="codex/nix-inputs-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          bash .github/scripts/source-git.sh push source "$branch"
+
+  verify-update:
+    needs: update
+    if: needs.update.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Fetch update branch
+        env:
+          CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          CI_DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY }}
+        run: |
+          set +x
+          branch="codex/nix-inputs-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          bash .github/scripts/source-git.sh clone source "$branch"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          install_url: https://releases.nixos.org/nix/nix-2.34.8/install
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+            sandbox = true
+      - name: Validate update branch
+        run: bash .github/scripts/private-source.sh check source
+
+  publish:
+    needs: [preflight, update, verify-update]
+    if: always() && needs.preflight.result == 'success' && needs.update.result == 'success' && needs.update.outputs.changed == 'true' && (needs.verify-update.result == 'success' || needs.verify-update.result == 'failure')
+    runs-on: ubuntu-24.04
+    environment: infra-automation
+    timeout-minutes: 10
+    steps:
+      - name: Create publication token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.INFRA_APP_ID }}
+          private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+          permission-pull-requests: write
+          permission-checks: write
+      - name: Open private update request and report result
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          branch="codex/nix-inputs-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          error_log=$(mktemp)
+          request=$(mktemp)
+          trap 'rm -f -- "$error_log" "$request"' EXIT
+          conclusion=failure
+          body='Automated input refresh. Private source validation failed; reproduce checks locally.'
+          if [[ '${{ needs.verify-update.result }}' == success ]]; then
+            conclusion=success
+            body='Automated input refresh. Private source validation passed.'
+          fi
+          if ! gh api -X POST "repos/$SOURCE_REPOSITORY/pulls" \
+            -f head="$branch" -f base=main \
+            -f title='Update Nix flake inputs' \
+            -f body="$body" \
+            >/dev/null 2>"$error_log"; then
+            echo 'error: could not open private update request' >&2
+            exit 1
+          fi
+          if ! revision=$(gh api "repos/$SOURCE_REPOSITORY/git/ref/heads/$branch" \
+            --jq '.object.sha' 2>"$error_log"); then
+            echo 'error: could not resolve update revision' >&2
+            exit 1
+          fi
+          jq -n --arg sha "$revision" --arg conclusion "$conclusion" \
+            --arg url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{name:"infra-ci/verification",head_sha:$sha,status:"completed",conclusion:$conclusion,details_url:$url,output:{title:"Infra verification",summary:"Reproduce failed checks locally; public logs omit private diagnostics."}}' >"$request"
+          if ! gh api -X POST "repos/$SOURCE_REPOSITORY/check-runs" \
+            --input "$request" >/dev/null 2>"$error_log"; then
+            echo 'error: could not report update result' >&2
+            exit 1
+          fi

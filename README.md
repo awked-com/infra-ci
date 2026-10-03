@@ -1,7 +1,14 @@
-# Infra CI workflow
+# Infra CI
 
-Public [GitHub Actions workflow](.github/workflows/build.yml) for
+Public [build workflow](.github/workflows/build.yml) for
 [nix-ci-worker](https://github.com/awked-com/nix-ci-worker).
+
+## Repository checks and updates
+
+[Repository CI](.github/workflows/ci.yml) tests the workflow launcher, vets the
+Go module, and validates workflows on pushes to `main` and pull requests. It
+needs no private credentials. [Dependabot](.github/dependabot.yml) opens weekly
+GitHub Actions and Go module update requests for this repository.
 
 ## Configure and run
 
@@ -12,7 +19,7 @@ workflow repository **Write** access under the GHCR package’s
 | Secret | Purpose |
 | --- | --- |
 | `CI_SOURCE_REPOSITORY` | Private source repository in `OWNER/NAME` form |
-| `CI_DEPLOY_KEY` | Read-write SSH deploy key for that source |
+| `CI_DEPLOY_KEY` | Read-write SSH deploy key for that source; Git operations only |
 | `CI_IDENTITY` | Age identity for encrypted inputs |
 | `CI_RECIPIENTS` | Age recipients for encrypted outputs |
 | `CI_STORAGE` | GHCR package configuration |
@@ -31,3 +38,38 @@ Workflow files, source refs, selections, and Actions logs are public. GHCR
 results and cache payloads and Actions coordination messages are encrypted.
 Never add source contents, secrets, build diagnostics, or source-derived details
 to this repository, logs, artifacts, or annotations.
+
+## Private source maintenance
+
+Create a GitHub App installed **only** on the private source repository with
+repository permissions **Contents: read**, **Pull requests: write**, and
+**Checks: write**. Set the `INFRA_APP_ID` repository variable to its App ID.
+Use the `infra-automation` environment, restricted to the `main` branch, and
+set its `INFRA_APP_PRIVATE_KEY` environment secret to the App's private key. The
+[maintenance workflow](.github/workflows/infra-maintenance.yml) requests
+short-lived installation tokens. It verifies that the App installation contains
+exactly the configured source repository before using a token. `infra ci sync`
+manages the build secrets above; configure the App variable and environment
+secret separately. Missing App access fails before an update branch is created.
+
+Maintenance checks the private source's `main` daily at 03:17 UTC. It runs Go
+tests, vet, and build, then `nix flake check`. At 03:43 UTC on Mondays it runs
+`nix flake update` and the same checks. Run the workflow manually with `check`
+or `update` for an extra run. The update creates a `codex/nix-inputs-*` branch
+only when the lock file changes and no earlier automated input update request
+is open. A separate runner validates that branch before a private pull request
+opens. Failed validation leaves a failing private pull request and branch for
+inspection; close the request and delete its branch manually after review. The
+workflow never merges or deploys.
+Package recipe pins and vendor hashes need separate review and updates.
+
+Private check output stays in temporary runner files and is discarded after
+the run. Public logs show generic failures; reproduce the checks locally for
+diagnostics. A GitHub App check on the exact private commit records the result.
+In maintenance jobs, the deploy key is available only during Git clone and push
+steps. The App token is used in jobs that do not execute private source code. The
+existing build workflow exposes its source ref and selections as public
+dispatch inputs, so do not use it to pass private pull request identifiers.
+Maintenance checks `main` and its own update branches. Other private pull
+requests do not yet trigger CI; they need a signed webhook relay or a
+privacy-reviewed polling design.
