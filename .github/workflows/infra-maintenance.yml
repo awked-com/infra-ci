@@ -127,7 +127,8 @@ jobs:
     outputs:
       revision_hash: ${{ steps.revision.outputs.revision_hash }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - &checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - &read-token
@@ -139,7 +140,8 @@ jobs:
           private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           permission-contents: read
-      - name: Fetch private source
+      - &fetch-source
+        name: Fetch private source
         env:
           CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
           CI_SOURCE_TOKEN: ${{ steps.source-token.outputs.token }}
@@ -151,13 +153,15 @@ jobs:
           revision=$(git -C source rev-parse HEAD 2>/dev/null)
           fingerprint=$(printf '%s' "$revision" | sha256sum | cut -d ' ' -f1)
           echo "revision_hash=$fingerprint" >>"$GITHUB_OUTPUT"
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - &setup-go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.8'
           cache: false
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - &install-nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
-          install_url: https://releases.nixos.org/nix/nix-2.34.8/install
+          install_url: https://releases.nixos.org/nix/nix-2.35.2/install
           extra_nix_config: |
             experimental-features = nix-command flakes
             accept-flake-config = false
@@ -221,26 +225,10 @@ jobs:
     outputs:
       changed: ${{ steps.commit.outputs.changed }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
+      - *checkout
       - *read-token
-      - name: Fetch private source
-        env:
-          CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
-          CI_SOURCE_TOKEN: ${{ steps.source-token.outputs.token }}
-        run: bash .github/scripts/source-git.sh clone source
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: '1.26.8'
-          cache: false
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-        with:
-          install_url: https://releases.nixos.org/nix/nix-2.34.8/install
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            accept-flake-config = false
-            sandbox = true
+      - *fetch-source
+      - *install-nix
       - name: Refresh private inputs
         run: bash .github/scripts/private-source.sh update source
       - name: Prepare update commit
@@ -295,9 +283,7 @@ jobs:
     environment: infra-automation
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
+      - *checkout
       - *read-token
       - name: Fetch update branch
         env:
@@ -307,17 +293,8 @@ jobs:
           set +x
           branch="codex/nix-inputs-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           bash .github/scripts/source-git.sh clone source "$branch"
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: '1.26.8'
-          cache: false
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-        with:
-          install_url: https://releases.nixos.org/nix/nix-2.34.8/install
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            accept-flake-config = false
-            sandbox = true
+      - *setup-go
+      - *install-nix
       - name: Validate update branch
         run: bash .github/scripts/private-source.sh check source
 
