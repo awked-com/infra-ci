@@ -38,15 +38,13 @@ jobs:
         id: mode
         env:
           APP_ID: ${{ vars.INFRA_APP_ID }}
-          APP_KEY: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
           SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
-          DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY }}
           SCHEDULE: ${{ github.event.schedule }}
           OPERATION: ${{ inputs.operation }}
         run: |
           set +x
           set -euo pipefail
-          if [[ -z "$APP_ID" || -z "$APP_KEY" || -z "$DEPLOY_KEY" ||
+          if [[ -z "$APP_ID" ||
                 ! "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
             echo 'error: infra maintenance credentials are not configured' >&2
             exit 1
@@ -124,6 +122,7 @@ jobs:
     needs: preflight
     if: needs.preflight.outputs.update == 'false'
     runs-on: ubuntu-24.04
+    environment: infra-automation
     timeout-minutes: 360
     outputs:
       revision_hash: ${{ steps.revision.outputs.revision_hash }}
@@ -131,10 +130,19 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - &read-token
+        name: Create source read token
+        id: source-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.INFRA_APP_ID }}
+          private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
       - name: Fetch private source
         env:
           CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
-          CI_DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY }}
+          CI_SOURCE_TOKEN: ${{ steps.source-token.outputs.token }}
         run: bash .github/scripts/source-git.sh clone source
       - name: Record checked revision
         id: revision
@@ -208,6 +216,7 @@ jobs:
     needs: preflight
     if: needs.preflight.outputs.update == 'true' && needs.preflight.outputs.proceed == 'true'
     runs-on: ubuntu-24.04
+    environment: infra-automation
     timeout-minutes: 360
     outputs:
       changed: ${{ steps.commit.outputs.changed }}
@@ -215,10 +224,11 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - *read-token
       - name: Fetch private source
         env:
           CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
-          CI_DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY }}
+          CI_SOURCE_TOKEN: ${{ steps.source-token.outputs.token }}
         run: bash .github/scripts/source-git.sh clone source
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -259,11 +269,20 @@ jobs:
             exit 1
           fi
           echo 'changed=true' >>"$GITHUB_OUTPUT"
+      - name: Create branch write token
+        if: steps.commit.outputs.changed == 'true'
+        id: write-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.INFRA_APP_ID }}
+          private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: write
       - name: Publish update branch
         if: steps.commit.outputs.changed == 'true'
         env:
           CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
-          CI_DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY }}
+          CI_SOURCE_TOKEN: ${{ steps.write-token.outputs.token }}
         run: |
           set +x
           branch="codex/nix-inputs-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
@@ -273,15 +292,17 @@ jobs:
     needs: update
     if: needs.update.outputs.changed == 'true'
     runs-on: ubuntu-24.04
+    environment: infra-automation
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - *read-token
       - name: Fetch update branch
         env:
           CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
-          CI_DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY }}
+          CI_SOURCE_TOKEN: ${{ steps.source-token.outputs.token }}
         run: |
           set +x
           branch="codex/nix-inputs-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"

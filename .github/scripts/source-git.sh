@@ -7,7 +7,7 @@ directory=${2:-}
 branch=${3:-}
 
 if [[ ! ${CI_SOURCE_REPOSITORY:-} =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] ||
-   [[ -z ${CI_DEPLOY_KEY:-} ]] || [[ -z $directory ]]; then
+   [[ -z ${CI_SOURCE_TOKEN:-} ]] || [[ -z $directory ]]; then
   echo 'error: private Git access is not configured' >&2
   exit 1
 fi
@@ -25,18 +25,26 @@ fi
 umask 077
 temporary=$(mktemp -d)
 trap 'rm -rf -- "$temporary"' EXIT
-printf '%s\n' "$CI_DEPLOY_KEY" >"$temporary/key"
-printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >"$temporary/known_hosts"
-export GIT_SSH_COMMAND="ssh -F /dev/null -i \"$temporary/key\" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=\"$temporary/known_hosts\""
+cat >"$temporary/askpass" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  *Username*) printf '%s\n' x-access-token ;;
+  *Password*) printf '%s\n' "$CI_SOURCE_TOKEN" ;;
+  *) exit 1 ;;
+esac
+SH
+chmod 700 "$temporary/askpass"
+export GIT_ASKPASS="$temporary/askpass" GIT_TERMINAL_PROMPT=0
 
 if [[ $operation == clone ]]; then
-  if ! git clone --quiet --depth 1 --branch "$branch" \
-    "git@github.com:${CI_SOURCE_REPOSITORY}.git" "$directory" >"$temporary/log" 2>&1; then
+  if ! git -c credential.helper= clone --quiet --depth 1 --branch "$branch" \
+    "https://github.com/${CI_SOURCE_REPOSITORY}.git" "$directory" >"$temporary/log" 2>&1; then
     echo 'error: private source checkout failed' >&2
     exit 1
   fi
 else
-  if ! git -C "$directory" -c core.hooksPath=/dev/null push --quiet origin \
+  if ! git -C "$directory" -c credential.helper= -c core.hooksPath=/dev/null push --quiet \
+    "https://github.com/${CI_SOURCE_REPOSITORY}.git" \
     "HEAD:refs/heads/$branch" >"$temporary/log" 2>&1; then
     echo 'error: update branch publication failed' >&2
     exit 1

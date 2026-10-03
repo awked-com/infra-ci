@@ -33,17 +33,57 @@ jobs:
   admit:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04-arm
+    environment: infra-automation
     timeout-minutes: 30
     outputs:
       matrix: ${{ steps.process.outputs.matrix }}
       helpers: ${{ steps.process.outputs.helpers }}
       revision: ${{ steps.process.outputs.revision }}
     steps:
+      - name: Require private source access
+        env:
+          APP_ID: ${{ vars.INFRA_APP_ID }}
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+        run: |
+          set +x
+          if [[ -z "$APP_ID" ||
+                ! "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo 'error: private source App access is not configured' >&2
+            exit 1
+          fi
+      - &source-token
+        name: Create private source token
+        id: source-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.INFRA_APP_ID }}
+          private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+      - &verify-scope
+        name: Verify App installation scope
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          response=$(mktemp)
+          error_log=$(mktemp)
+          trap 'rm -f -- "$response" "$error_log"' EXIT
+          if ! gh api 'installation/repositories?per_page=2' >"$response" 2>"$error_log" ||
+             ! jq -e --arg repository "$SOURCE_REPOSITORY" \
+               '.total_count == 1 and .repositories[0].full_name == $repository' \
+               "$response" >/dev/null 2>&1; then
+            echo 'error: private source App installation scope is invalid' >&2
+            exit 1
+          fi
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: ${{ secrets.CI_SOURCE_REPOSITORY }}
           ref: ${{ inputs.source }}
-          ssh-key: ${{ secrets.CI_DEPLOY_KEY }}
+          token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
           path: source
           show-progress: false
@@ -151,6 +191,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.admit.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
+    environment: infra-automation
     timeout-minutes: 360
     steps:
       - &setup-swap
@@ -176,12 +217,14 @@ jobs:
           sudo mkswap "$swap_file"
           sudo swapon --verbose "$swap_file"
 
+      - *source-token
+      - *verify-scope
       - &checkout-source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: ${{ secrets.CI_SOURCE_REPOSITORY }}
           ref: ${{ needs.admit.outputs.revision }}
-          ssh-key: ${{ secrets.CI_DEPLOY_KEY }}
+          token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
           path: source
           show-progress: false
@@ -213,9 +256,12 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.admit.outputs.helpers) }}
     runs-on: ${{ matrix.runner }}
+    environment: infra-automation
     timeout-minutes: 360
     steps:
       - *setup-swap
+      - *source-token
+      - *verify-scope
       - *checkout-source
       - *setup-go
       - *install-nix
