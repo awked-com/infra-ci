@@ -1,6 +1,6 @@
 # Infra CI
 
-Public [build workflow](.github/workflows/build.yml) for
+Manually dispatched public [build cache workflow](.github/workflows/build.yml) for
 [nix-ci-worker](https://github.com/awked-com/nix-ci-worker).
 
 ## Configure and run
@@ -17,11 +17,10 @@ under the GHCR package's **Manage Actions access** settings. Configure:
 | `NIX_SIGNING_KEY` | Final Nix cache signing key, coordinators only |
 
 Create the organization-owned GitHub App `awked-infra-ci`, installed **only** on
-the private source repository, with **Contents: write**, **Pull requests: write**,
-and **Checks: write**. Set its client ID in the `INFRA_APP_CLIENT_ID` repository
-variable. Create the `infra-automation` environment, restrict it to `main`, and
-set its `INFRA_APP_PRIVATE_KEY` secret. `infra ci sync` manages the build secrets
-above; configure the App separately.
+the private source repository, with **Contents: read**. Set its client ID in the
+`INFRA_APP_CLIENT_ID` repository variable. Create the `infra-automation`
+environment, restrict it to `main`, and set its `INFRA_APP_PRIVATE_KEY` secret.
+`infra ci sync` manages the build secrets above; configure the App separately.
 
 ## Builds
 
@@ -39,28 +38,12 @@ Actions coordination messages are encrypted. Never expose private source,
 secrets, diagnostics, or source-derived details in this repository or its output.
 Build subprocesses receive neither the App key nor write tokens.
 
-## Private source maintenance
+## Local checks
 
-[Maintenance](.github/workflows/infra-maintenance.yml) checks private `main` daily
-at 03:17 UTC and updates Nix inputs Mondays at 03:43 UTC. Manual runs accept
-`check` or `update`. It verifies the App's single-repository scope before use.
-Checks run Go tests, vet, build, and `nix flake check` with private diagnostics
-suppressed; reproduce failures locally. A private check records the commit's
-result.
+With Go and Node.js installed, run:
 
-Updates create a `codex/nix-inputs-*` branch only when the lockfile changes and
-no earlier update request is open. A separate runner validates it before opening
-a private pull request, including on validation failure. Review failed requests
-and delete their branches manually. Maintenance never merges or deploys; package
-pins and vendor hashes need separate updates. Other private pull requests do not
-trigger CI.
-
-Read tokens are scoped to clone steps; branch-write tokens are issued after the
-refresh. Publication jobs never execute private source. Do not pass private pull
-request identifiers through the public build inputs.
-
-## Repository checks and updates
-
-With Go and Node.js installed, run `go test -race ./...` and `go vet ./...`.
-[Repository CI](.github/workflows/ci.yml) also runs actionlint; it needs no private
-credentials. [Dependabot](.github/dependabot.yml) checks dependencies weekly.
+```sh
+go test -race ./...
+go vet ./...
+go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -ignore 'unexpected key "queue" for "concurrency" section'
+```
