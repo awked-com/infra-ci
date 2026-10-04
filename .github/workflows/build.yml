@@ -128,7 +128,7 @@ jobs:
             delete workerEnv['INPUT_GITHUB-TOKEN'];
             const compileEnv = {...workerEnv, GOTOOLCHAIN: 'local'};
             for (const name of Object.keys(compileEnv)) {
-              if (/^(ACTIONS_|CI_|REGISTRY_|NIX_SIGNING_KEY$|GITHUB_TOKEN$|GH_TOKEN$)/.test(name)) {
+              if (/^(ACTIONS_|CI_|REGISTRY_|NIX_SIGNING_KEY$|GITHUB_TOKEN$|GH_)/.test(name)) {
                 delete compileEnv[name];
               }
             }
@@ -161,7 +161,7 @@ jobs:
                 set +x
                 ulimit -c 0
                 export GOBIN="$RUNNER_TEMP"
-                exec go install github.com/awked-com/nix-ci-worker/cmd/nix-ci-worker@v0.0.0-20261003224128-55936e1a0af0 \
+                exec go install github.com/awked-com/nix-ci-worker/cmd/nix-ci-worker@v0.0.0-20261004004815-db17755d4ada \
                   >"$RUNNER_TEMP/infra-ci-compile.log" 2>&1
               `, compileEnv);
               if (cancelled) {
@@ -169,7 +169,7 @@ jobs:
               } else if (compiled !== 0) {
                 failure = 'Worker compilation failed.';
               } else {
-                exitCode = await run('set +x; ulimit -c 0; exec "$RUNNER_TEMP/nix-ci-worker"', workerEnv);
+                exitCode = await run('set +x; ulimit -c 0; exec "$RUNNER_TEMP/nix-ci-worker" >"$RUNNER_TEMP/infra-ci-worker.log" 2>&1', workerEnv);
                 if (exitCode !== 0) failure = 'Worker failed.';
               }
             } catch {

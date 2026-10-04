@@ -36,7 +36,9 @@ credentials. Helpers must never receive the final signing key.
 Workflow files, source refs, selections, and logs are public. GHCR payloads and
 Actions coordination messages are encrypted. Never expose private source,
 secrets, diagnostics, or source-derived details in this repository or its output.
-Build subprocesses receive neither the App key nor write tokens.
+Build subprocesses receive neither the App key nor write tokens. Raw compiler
+and worker diagnostics stay in mode-0600 files under `RUNNER_TEMP`; they are
+not uploaded as artifacts.
 
 ## Local checks
 

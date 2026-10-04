@@ -94,6 +94,7 @@ new AsyncFunction('require', 'core', `+string(encoded)+`)(require, core).catch((
 				"REGISTRY_TOKEN":                 "fixture-registry-secret",
 				"GITHUB_TOKEN":                   "fixture-github-secret",
 				"GH_TOKEN":                       "fixture-gh-secret",
+				"GH_ENTERPRISE_TOKEN":            "fixture-gh-enterprise-secret",
 				"NIX_SIGNING_KEY":                "fixture-signing-secret",
 				"INPUT_GITHUB-TOKEN":             "fixture-duplicate-token-secret",
 				"RUNNER_TRACKING_ID":             "fixture-tracking-id",
@@ -195,10 +196,19 @@ new AsyncFunction('require', 'core', `+string(encoded)+`)(require, core).catch((
 				if !reflect.DeepEqual(worker.Environment, credentials) {
 					t.Fatal("worker did not receive its credentials or inherited redundant credentials")
 				}
+				workerLog := filepath.Join(root, "infra-ci-worker.log")
+				data, err := os.ReadFile(workerLog)
+				if err != nil {
+					t.Fatal(err)
+				}
 				for _, message := range []string{"WORKER_STDOUT", "WORKER_STDERR"} {
-					if !strings.Contains(output.String(), message) {
-						t.Fatalf("worker output was not streamed: %s", message)
+					if strings.Contains(output.String(), message) || !strings.Contains(string(data), message) {
+						t.Fatalf("worker diagnostic must stay on the runner: %s", message)
 					}
+				}
+				info, err := os.Stat(workerLog)
+				if err != nil || info.Mode().Perm() != 0600 {
+					t.Fatalf("worker log must have mode 0600: %v", err)
 				}
 			}
 			if test.signal != 0 {
