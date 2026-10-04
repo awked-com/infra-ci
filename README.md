@@ -34,7 +34,8 @@ its derivation JSON schema. The launcher supplies job-scoped Actions cache
 credentials. Helpers must never receive the final signing key.
 
 Workflow files, source refs, selections, and logs are public. GHCR payloads and
-Actions coordination messages are encrypted. Never expose private source,
+Actions coordination messages and temporary build transfers are encrypted.
+Never expose private source,
 secrets, diagnostics, or source-derived details in this repository or its output.
 Build subprocesses receive neither the App key nor write tokens. Raw compiler
 and worker diagnostics stay in mode-0600 files under `RUNNER_TEMP`; they are
